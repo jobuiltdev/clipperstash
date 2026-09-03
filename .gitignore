@@ -1,0 +1,54 @@
+# --- Environment ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Python tooling ---------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Django -----------------------------------------------------------------
+backend/staticfiles/
+backend/media/
+*.sqlite3
+
+# --- Node / Next.js ---------------------------------------------------------
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+.eslintcache
+
+# --- Logs and runtime state -------------------------------------------------
+*.log
+logs/
+celerybeat-schedule
+celerybeat.pid
+*.pid
+
+# --- Editors ----------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+
+# --- OS ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Deployment tooling -----------------------------------------------------
+.vercel/

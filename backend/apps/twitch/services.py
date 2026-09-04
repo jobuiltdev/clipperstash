@@ -18,6 +18,8 @@ from apps.twitch.client import (
     TokenResponse,
     TokenValidation,
     TwitchClient,
+    TwitchClip,
+    TwitchClipRequest,
     TwitchIdentity,
     TwitchStream,
 )
@@ -317,6 +319,73 @@ def create_chat_message_subscription(
         subscription.status,
     )
     return subscription
+
+
+def _with_user_token(connection: TwitchConnection, call, *, client: TwitchClient):
+    """Run a Twitch call as the connected user, refreshing at most once.
+
+    The established pattern: use the stored token as-is, and on a 401 refresh
+    exactly once and replay. A second rejection flags the connection for
+    re-authorization and propagates. There is no third attempt, so this cannot
+    loop.
+    """
+    try:
+        return call(connection.get_access_token())
+    except TwitchAuthenticationError:
+        logger.info("Twitch rejected the access token; refreshing once and retrying.")
+
+    connection = refresh_connection(connection, client=client)
+
+    try:
+        return call(connection.get_access_token())
+    except TwitchAuthenticationError:
+        logger.warning(
+            "Twitch rejected the refreshed access token for user_id=%s; re-authorization required.",
+            connection.twitch_user_id,
+        )
+        connection.mark_requires_reauthorization()
+        raise
+
+
+def create_clip(
+    connection: TwitchConnection,
+    *,
+    broadcaster_id: str,
+    client: TwitchClient | None = None,
+) -> TwitchClipRequest:
+    """Request a clip as the connected account.
+
+    Twitch requires a user token with `clips:edit` here; the app token is not
+    accepted. The caller is responsible for having checked the connection's
+    capability first.
+    """
+    client = client or TwitchClient()
+    return _with_user_token(
+        connection,
+        lambda token: client.create_clip(broadcaster_id=broadcaster_id, access_token=token),
+        client=client,
+    )
+
+
+def get_clip(
+    connection: TwitchConnection,
+    clip_id: str,
+    *,
+    client: TwitchClient | None = None,
+) -> TwitchClip | None:
+    """Look up a clip as the connected account.
+
+    Get Clips accepts either an app or a user token. The connected user's token
+    is used deliberately: the clip was requested with it, so verifying with the
+    same credentials keeps one authorization path for the whole operation and
+    avoids minting an app token purely to read back our own request.
+    """
+    client = client or TwitchClient()
+    return _with_user_token(
+        connection,
+        lambda token: client.get_clip(clip_id, access_token=token),
+        client=client,
+    )
 
 
 def build_connection_status(connection: TwitchConnection | None) -> dict[str, Any]:

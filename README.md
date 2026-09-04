@@ -7,13 +7,12 @@ Twitch clips and collects them in one dashboard. See
 [`docs/architecture.md`](docs/architecture.md) for the product objective, the
 current architecture and the planned pipeline.
 
-**Status:** foundation, the Twitch API and OAuth layer, streamer resolution,
-on-demand live/offline observation, chat ingestion for a live session, and
-moment detection over the stored chat. A Twitch channel can be resolved, checked
-for a live broadcast, its chat read over an EventSub WebSocket, and that chat
-scored for clip-worthy moments. Clip creation is not implemented, and nothing
-runs on a schedule — those stages are listed as `NOT IMPLEMENTED` in the
-architecture document.
+**Status:** the V0 pipeline runs end to end, one manual step at a time. A Twitch
+channel can be resolved, checked for a live broadcast, its chat read over an
+EventSub WebSocket, that chat scored for clip-worthy moments, and a detected
+moment turned into a real Twitch clip. Nothing runs on a schedule, no stage
+triggers the next automatically, and clips are not downloaded or edited — those
+stages are listed as `NOT IMPLEMENTED` in the architecture document.
 
 ## Repository layout
 
@@ -387,6 +386,90 @@ one burst produces one row rather than one per evaluation.
 All of these live in `backend/apps/moments/detector/config.py`. They are initial
 calibration values chosen to be explainable, not tuned ones, and are expected to
 move once real streams have been replayed.
+
+## Creating a clip
+
+A detected moment can be turned into a real Twitch clip. Like every other stage,
+this is run explicitly — detection does not trigger it.
+
+```bash
+cd backend
+python manage.py create_clip <moment-candidate-id>
+```
+
+It needs the same connected Twitch account as chat ingestion, using the
+`clips:edit` scope that connection already requests. No new scope is required.
+
+### The moment must be fresh
+
+Twitch's live Create Clip captures **what is airing when the request arrives**.
+It cannot reach back to the moment that was detected. So a candidate is only
+eligible while it is at most **15 seconds old**; anything older would clip an
+unrelated part of the stream while claiming to be that moment, and is refused
+with `stale_moment_candidate`.
+
+This is why a candidate produced by `detect_moments --at <past timestamp>` is
+deliberately **not** eligible for live clipping. Those replayed candidates are
+for calibration. Clipping a past moment exactly needs Twitch's VOD path, which
+is not implemented. A refusal on these grounds is a precondition failure: the
+candidate stays `DETECTED` and nothing is sent to Twitch.
+
+The stream must also still be live according to stream observation. That, too,
+is a precondition — a clip request never changes stream state, and never asks
+Twitch about it.
+
+### Creation is asynchronous
+
+Twitch answers a clip request with `202 Accepted`, which means the request was
+taken, **not** that a clip exists. ClipperStash then polls
+`GET /helix/clips` until Twitch confirms it, and only then records the clip and
+its authoritative URL.
+
+The verification deadline is **60 seconds**, polled every 2 seconds. Twitch's own
+documentation is inconsistent here — the Clips guide says to assume failure
+after 15 seconds while the API reference says 60 — and the longer bound is used
+deliberately, so a clip Twitch is still assembling is not abandoned. Both values
+live in `backend/apps/clips/config.py`.
+
+If the deadline passes, the candidate is marked `FAILED` but the Twitch clip id
+is kept, so a clip that appears late can still be found by hand.
+
+### Candidate lifecycle
+
+```
+DETECTED  ->  CLIP_REQUESTED  ->  CLIP_CREATED
+                             \->  FAILED
+```
+
+Each attempt is idempotent. An already-confirmed candidate returns its existing
+clip; one whose request was accepted but whose run was interrupted resumes
+verification without asking Twitch for a second clip:
+
+```bash
+python manage.py create_clip <moment-candidate-id> --verify-only
+```
+
+A `FAILED` candidate is not retried automatically.
+
+### When the outcome is unknown
+
+The local claim stops two callers requesting the same moment at once. It cannot
+cover the gap between that claim committing and Twitch's clip id reaching the
+database — Twitch's Create Clip accepts no application-supplied idempotency key,
+so there is no way to ask whether an earlier request landed.
+
+If execution is interrupted in that gap, or a request times out with an outcome
+that cannot be determined, the candidate stays `CLIP_REQUESTED` with no clip id
+and is reported as `clip_request_state_unknown`. ClipperStash will **not**
+re-send from that state: doing so could create a second clip of an unrelated
+part of the stream. Nothing is reset, failed or deleted, so an operator
+reconciliation policy — deferred to a later milestone — has everything it needs.
+
+### Not yet
+
+Nothing connects the stages: chat ingestion does not run the detector, and the
+detector does not request clips. Clips are not downloaded, edited, captioned or
+posted anywhere.
 
 ## Checks
 

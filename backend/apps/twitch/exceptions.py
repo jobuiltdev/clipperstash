@@ -34,6 +34,17 @@ class TwitchAPIError(TwitchError):
         self.status_code = status_code
 
 
+class TwitchTransportError(TwitchAPIError):
+    """The request could not be completed over the network.
+
+    A subclass of `TwitchAPIError`, so every existing handler keeps working. It
+    exists because this failure is *ambiguous* in a way an HTTP status is not: a
+    timeout or dropped connection can happen before Twitch saw the request,
+    while it was acting on it, or after it answered. Callers whose request has a
+    side effect need to tell that apart from a definite refusal.
+    """
+
+
 class TwitchOAuthStateError(TwitchError):
     """The OAuth `state` was missing, unknown, expired, malformed or reused."""
 

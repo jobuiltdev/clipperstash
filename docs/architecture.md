@@ -88,8 +88,18 @@ Nothing drives those checks on a schedule.
 - `MomentCandidate` persistence, recording the full working behind a finding.
 - A `detect_moments` management command, including historical replay.
 
-The detector decides *that* a moment happened. Acting on that — creating a clip
-— is not implemented.
+The detector decides *that* a moment happened.
+
+**Milestone 6 — clip creation. IMPLEMENTED.**
+
+- Twitch Create Clip with the connected user's token, and Get Clips to confirm
+  the result actually exists.
+- A freshness rule that keeps live clipping honest about what it captures.
+- A transactional claim, so one moment produces at most one clip request.
+- `Clip` persistence and the `CLIP_REQUESTED -> CLIP_CREATED / FAILED`
+  transitions, with a `create_clip` management command.
+
+That completes the V0 pipeline as a sequence of manual steps.
 
 Explicitly still out of scope:
 
@@ -138,12 +148,12 @@ the health view and the Celery application. Product code lives under
 | `twitch`     | Twitch API client, OAuth and credential handling             | IMPLEMENTED (see below) |
 | `monitoring` | Stream sessions and realtime signal ingestion                | IMPLEMENTED (see below) |
 | `moments`    | Moment scoring and interesting-moment detection              | IMPLEMENTED (see below) |
-| `clips`      | Clip records, clip creation and the dashboard's read models  | NOT IMPLEMENTED         |
+| `clips`      | Clip records, clip creation and the dashboard's read models  | IMPLEMENTED (see below) |
 
 The EventSub transport lives in `twitch`, under `apps/twitch/eventsub/`;
-`monitoring` owns the chat domain that consumes it, and `moments` owns detection
-over that chat. `clips` still contains only its `AppConfig` and an empty `models`
-module.
+`monitoring` owns the chat domain that consumes it, `moments` owns detection over
+that chat, and `clips` owns turning a detected moment into a Twitch clip. The
+dashboard read models `clips` will eventually also own are NOT IMPLEMENTED.
 
 ### Twitch integration
 
@@ -611,6 +621,127 @@ continuous detector scheduling        NOT IMPLEMENTED
 automatic invocation from EventSub    NOT IMPLEMENTED
 ```
 
+### Clip creation
+
+`backend/apps/clips/` turns a detected moment into a real Twitch clip. Like the
+rest of the pipeline it builds no Twitch requests of its own: transport stays in
+the `twitch` app.
+
+| Module              | Responsibility                                        |
+| ------------------- | ----------------------------------------------------- |
+| `config.py`         | The freshness budget and verification timings          |
+| `models.py`         | `Clip`, and the controlled failure vocabulary          |
+| `exceptions.py`     | Preconditions kept distinct from post-claim failures   |
+| `services.py`       | Preconditions, the claim, the request, verification    |
+| `management/commands/create_clip.py` | The manual entry point                |
+
+**Create Clip is a user-token operation.** Twitch requires a user access token
+carrying `clips:edit`; the app token used for resolution and stream observation
+is not accepted. That scope is already part of the connection requested in
+Milestone 1, so Milestone 6 adds no new scope. Only `broadcaster_id` is sent —
+Twitch's stable id, never a login. A custom title is deliberately omitted
+because it can be rejected by AutoMod, and a custom duration because there is no
+evidence yet on which to tune one.
+
+**202 does not mean created.** Twitch answers an accepted request with `202
+Accepted` and a clip id. The clip may not exist yet, so nothing advances on the
+strength of that alone: `GET /helix/clips?id=<id>` is polled until Twitch returns
+the clip, and only then is it recorded. An empty result means "not ready", never
+"failed". The URL stored is the one Twitch returns; it is never assembled from
+the id, because a guessed link might not resolve.
+
+The verification deadline is 60 seconds, polled every 2. Twitch's documentation
+contradicts itself here — the Clips guide says to assume failure after 15
+seconds, the API reference says 60 — and the longer bound is chosen so a clip
+still being assembled is not abandoned. A test pins the value so changing it is
+deliberate. Elapsed time is measured on the monotonic clock, so a system clock
+adjustment mid-poll cannot move the deadline; the clock and sleeper are injected,
+so the whole cycle runs instantly under test.
+
+**Freshness is the load-bearing rule.** Live Create Clip captures what is airing
+when the request arrives — it cannot reach back to the detected moment. A
+candidate is therefore only eligible while at most 15 seconds old, inclusive at
+the limit, with a two-second tolerance for clock skew in the other direction.
+Anything older is refused: clipping it would capture an unrelated part of the
+stream while claiming to be that moment. This is exactly why a candidate
+produced by `detect_moments --at` is not eligible — replayed moments are for
+calibration, and clipping a past moment precisely needs Twitch's VOD path, which
+is NOT IMPLEMENTED.
+
+**One clip per moment.** Clipping is claimed inside a short transaction: the
+candidate row is locked with `SELECT ... FOR UPDATE`, its state re-read under
+that lock, its single `Clip` created, and the status moved `DETECTED ->
+CLIP_REQUESTED`. A second caller blocks on the lock and then sees the work is
+already under way rather than sending its own request. The transaction closes
+before any HTTP happens — holding one open across a minute of polling would pin
+a connection for no reason. A `OneToOneField` and a unique `twitch_clip_id` make
+the invariant the database's, not the service's.
+
+**Two kinds of failure, kept apart.** A *precondition* — stale candidate, ended
+session, ineligible status, missing or unscoped connection — means nothing was
+claimed and nothing was sent, so the candidate is left exactly as it was. A
+stale moment is not a broken one. A failure *after* the claim — a rejected
+request, an unrecoverable authentication failure, an unreadable acceptance, a
+verification timeout, a broadcaster mismatch — moves the candidate to `FAILED`
+with a short controlled reason. A 401 refreshes the token once and retries once,
+as everywhere else; a 403 is a channel clip restriction rather than a
+credentials problem, so it never flags the connection for re-authorization.
+
+**Stream state is untouched.** A clip request never changes a `StreamSession`,
+and a Twitch 404 saying the broadcaster is not live proves nothing about it:
+stream lifecycle remains entirely owned by stream observation, which is not
+consulted over HTTP here at all.
+
+**Recovery.** A candidate whose request Twitch accepted but whose run was
+interrupted can be resumed: verification runs again against the stored clip id
+with no second `POST`. A verification timeout keeps that id for exactly this
+reason — a clip that appears after the deadline can still be found by hand.
+There is no background retry.
+
+**The limit of exactly-once.** Twitch's Create Clip accepts no
+application-supplied idempotency key, so ClipperStash cannot ask whether a
+request it already sent was received. The claim makes *concurrent* callers safe,
+but a window remains between the claim committing and the clip id being stored.
+A crash there — or a timeout that cannot distinguish "never arrived" from
+"arrived and was accepted" — leaves a candidate `CLIP_REQUESTED` with a clip row
+and no id.
+
+That state is treated as indeterminate, not failed. It surfaces as
+`clip_request_state_unknown`, and no further request is ever sent automatically
+from it: re-sending could clip an unrelated part of the stream. The candidate is
+not reverted to `DETECTED`, not marked `FAILED`, no id is invented, Get Clips is
+not called without one, and nothing is deleted — the row is left exactly as it
+is for an operator policy that is deliberately deferred.
+
+The distinction is drawn on whether Twitch answered. A definitive response —
+400, 403, 404, a second 401, or an accepted response with an unusable body — is
+a known failure. A transport error is not, and is raised as a distinct
+`TwitchTransportError` so it cannot be mistaken for one. The bounded 401 refresh
+and single retry remains the only automatic re-send anywhere in this path, and
+is safe precisely because Twitch rejected the first request outright. Nothing
+else retries: the HTTP client itself is configured with no transport retries.
+
+ClipperStash guarantees one local claim per moment and no automatic duplicate
+request. It cannot guarantee Twitch did or did not act on a request whose
+outcome it never learned, and does not pretend otherwise.
+
+**What a clip holds.** The Twitch clip id, the URL Twitch returned, title,
+duration, thumbnail, Twitch's creation time, when ClipperStash requested and
+confirmed it, and a short failure code. No token, no raw response, no chat
+content, no chatter identity — and deliberately not the `edit_url` Twitch
+returns, which is a browser convenience ClipperStash neither automates nor
+stores.
+
+**Runtime.** `manage.py create_clip <candidate-id>`, optionally `--verify-only`.
+Run by a person. Nothing chains the stages together:
+
+```
+automatic detector -> clip orchestration   NOT IMPLEMENTED
+background clip worker                     NOT IMPLEMENTED
+clip download / FFmpeg / captions          NOT IMPLEMENTED
+VOD historical clipping                    NOT IMPLEMENTED
+```
+
 ### API surface
 
 | Method | Path                          | Notes                                              |
@@ -640,7 +771,7 @@ reaches the browser, its URL, its storage or its JavaScript state.
 
 - **PostgreSQL** is the primary datastore. The product tables are
   `twitch_twitchconnection`, `streamers_streamer`, `monitoring_streamsession`,
-  `monitoring_chatmessage` and `moments_momentcandidate`.
+  `monitoring_chatmessage`, `moments_momentcandidate` and `clips_clip`.
 - **Redis** is the Celery broker and result backend, and also backs Django's
   cache, which holds the app access token and in-flight OAuth state.
 - **Celery** is configured in `backend/clipperstash/celery.py` and exposes a
@@ -683,8 +814,8 @@ Twitch API access / OAuth         IMPLEMENTED
   -> live / offline observation   IMPLEMENTED
   -> chat ingestion               IMPLEMENTED (on demand)
   -> moment scoring               IMPLEMENTED (on demand)
+  -> Twitch clip                  IMPLEMENTED (on demand)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> Twitch clip                  NOT IMPLEMENTED
   -> ClipperStash dashboard       NOT IMPLEMENTED
 ```
 
@@ -698,8 +829,8 @@ Streamer URL                      IMPLEMENTED
   -> realtime Twitch chat ingestion   IMPLEMENTED (on demand)
   -> moment scoring               IMPLEMENTED (on demand)
   -> interesting moment detection IMPLEMENTED (on demand)
+  -> Twitch clip creation         IMPLEMENTED (on demand)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> Twitch clip creation         NOT IMPLEMENTED
   -> ClipperStash dashboard       NOT IMPLEMENTED
 ```
 
@@ -722,6 +853,6 @@ The pieces already in place map onto the pipeline as follows: the `twitch` app
 owns API access and credentials today and will own EventSub and chat ingestion,
 `streamers` owns channel identity, `monitoring` owns live detection, session
 state and chat ingestion, `moments` owns scoring over the stored chat, and
-`clips` will own clip records and the dashboard's read side. Clip creation will use the `clips:edit` scope already
+`clips` owns clip creation and will own the dashboard's read side. Clip creation will use the `clips:edit` scope already
 being requested, and will act on a `Streamer` that has already been resolved. Long-running and scheduled work will run on the existing
 Celery worker against Redis, and all durable state will live in PostgreSQL.

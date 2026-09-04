@@ -35,6 +35,31 @@ def no_real_websocket(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_twitch_http(monkeypatch):
+    """Make a live Twitch HTTP request impossible for the whole suite.
+
+    Every test drives `TwitchClient` through an in-process `httpx.MockTransport`.
+    A client built without one would talk to Twitch for real, so reaching the
+    network is turned into a loud failure rather than a silent request. This
+    catches the case where a module imported `TwitchClient` directly and a test
+    patched only some other module's reference to it.
+    """
+    from apps.twitch.client import TwitchClient
+
+    original = TwitchClient._send
+
+    def guarded(self, method, url, **kwargs):
+        if self._transport is None:
+            raise AssertionError(
+                "Tests must never make a real Twitch HTTP request; "
+                f"a client with no mock transport tried {method} {url}."
+            )
+        return original(self, method, url, **kwargs)
+
+    monkeypatch.setattr(TwitchClient, "_send", guarded)
+
+
+@pytest.fixture(autouse=True)
 def twitch_test_settings(settings):
     """Configure a fake Twitch application and an in-memory cache."""
     settings.TWITCH_CLIENT_ID = FAKE_CLIENT_ID

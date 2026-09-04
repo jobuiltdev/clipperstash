@@ -24,6 +24,7 @@ from apps.twitch.exceptions import (
     TwitchAPIError,
     TwitchAuthenticationError,
     TwitchConfigurationError,
+    TwitchTransportError,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,11 @@ EVENTSUB_WEBSOCKET_URL = "wss://eventsub.wss.twitch.tv/ws"
 
 CHAT_MESSAGE_SUBSCRIPTION_TYPE = "channel.chat.message"
 CHAT_MESSAGE_SUBSCRIPTION_VERSION = "1"
+
+# Twitch answers a successful clip request with 202 Accepted, meaning the
+# request was taken — not that a clip exists. Any other 2xx is a shape we do not
+# recognize and is treated as unusable.
+CLIP_ACCEPTED_STATUS = 202
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
@@ -129,6 +135,36 @@ class EventSubSubscription:
 
 
 @dataclass(frozen=True)
+class TwitchClipRequest:
+    """Twitch's acknowledgement of a clip request.
+
+    Deliberately holds only the clip id. Twitch also returns an `edit_url` for a
+    human to open in a browser; ClipperStash has no use for it, does not
+    automate it and does not keep it, so it is validated for shape and then
+    discarded rather than carried into the domain.
+    """
+
+    clip_id: str
+
+
+@dataclass(frozen=True)
+class TwitchClip:
+    """A clip as Twitch reports it once it exists."""
+
+    clip_id: str
+    url: str
+    broadcaster_id: str
+    creator_id: str
+    video_id: str
+    game_id: str
+    language: str
+    title: str
+    created_at: datetime
+    thumbnail_url: str
+    duration: float
+
+
+@dataclass(frozen=True)
 class TwitchStream:
     """A live broadcast as returned by `GET /helix/streams`.
 
@@ -198,6 +234,54 @@ def stream_from_helix_entry(entry: Any, *, expected_user_id: str | None = None) 
         thumbnail_url=str(entry.get("thumbnail_url") or ""),
         is_mature=bool(entry.get("is_mature")),
     )
+
+
+def clip_from_helix_entry(entry: Any) -> TwitchClip:
+    """Build a clip from one `GET /helix/clips` entry.
+
+    The URL is taken from Twitch rather than assembled from the id: only Twitch
+    knows the canonical address, and guessing one would risk publishing a link
+    that does not resolve.
+    """
+    if not isinstance(entry, dict):
+        raise TwitchAPIError("Twitch returned an unexpected clip object.")
+
+    clip_id = str(entry.get("id") or "")
+    url = str(entry.get("url") or "")
+    broadcaster_id = str(entry.get("broadcaster_id") or "")
+    if not clip_id or not url or not broadcaster_id:
+        raise TwitchAPIError("Twitch returned a clip without an id, url or broadcaster.")
+
+    duration = entry.get("duration")
+    if isinstance(duration, bool) or not isinstance(duration, int | float) or duration < 0:
+        raise TwitchAPIError("Twitch returned a clip without a usable duration.")
+
+    return TwitchClip(
+        clip_id=clip_id,
+        url=url,
+        broadcaster_id=broadcaster_id,
+        creator_id=str(entry.get("creator_id") or ""),
+        video_id=str(entry.get("video_id") or ""),
+        game_id=str(entry.get("game_id") or ""),
+        language=str(entry.get("language") or ""),
+        title=str(entry.get("title") or ""),
+        created_at=parse_twitch_datetime(entry.get("created_at"), "clip creation time"),
+        thumbnail_url=str(entry.get("thumbnail_url") or ""),
+        duration=float(duration),
+    )
+
+
+def parse_twitch_datetime(value: Any, label: str) -> datetime:
+    """Parse an ISO 8601 instant from Twitch into a timezone-aware datetime."""
+    if not isinstance(value, str) or not value:
+        raise TwitchAPIError(f"Twitch returned no {label}.")
+    try:
+        parsed = parse_datetime(value)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.tzinfo is None:
+        raise TwitchAPIError(f"Twitch returned an unreadable {label}.")
+    return parsed
 
 
 def parse_started_at(value: Any) -> datetime:
@@ -274,7 +358,9 @@ class TwitchClient:
             with self._client() as client:
                 return client.request(method, url, **kwargs)
         except httpx.RequestError as exc:
-            raise TwitchAPIError(f"Could not reach Twitch ({type(exc).__name__}).") from None
+            # Deliberately a distinct type: the request may or may not have
+            # reached Twitch, which matters when it would have a side effect.
+            raise TwitchTransportError(f"Could not reach Twitch ({type(exc).__name__}).") from None
 
     @staticmethod
     def _decode(response: httpx.Response) -> dict[str, Any]:
@@ -301,7 +387,19 @@ class TwitchClient:
                 return value
         return "no additional detail"
 
-    def _raise_for_status(self, response: httpx.Response) -> None:
+    def _raise_for_status(
+        self,
+        response: httpx.Response,
+        *,
+        auth_statuses: tuple[int, ...] = (401, 403),
+    ) -> None:
+        """Map a failed response onto a typed error.
+
+        `auth_statuses` says which codes mean "these credentials are wrong". It
+        is adjustable because 403 is not always an authentication problem: on
+        clip creation it means the channel does not allow this clip, which no
+        amount of re-authorizing would fix.
+        """
         if response.is_success:
             return
         try:
@@ -310,7 +408,7 @@ class TwitchClient:
             payload = None
         detail = self._describe(payload) if isinstance(payload, dict) else "no additional detail"
 
-        if response.status_code in (401, 403):
+        if response.status_code in auth_statuses:
             raise TwitchAuthenticationError(
                 f"Twitch rejected the credentials (HTTP {response.status_code}): {detail}",
                 status_code=response.status_code,
@@ -463,6 +561,67 @@ class TwitchClient:
         )
         self._raise_for_status(response)
         return self._decode(response)
+
+    def create_clip(self, *, broadcaster_id: str, access_token: str) -> TwitchClipRequest:
+        """Ask Twitch to capture a clip of what is airing right now.
+
+        Requires a **user** access token carrying `clips:edit`; the app token is
+        not accepted. Only `broadcaster_id` is sent: a custom title risks
+        AutoMod rejection and a custom duration is not worth tuning before the
+        pipeline has been evaluated, so Twitch's defaults are used.
+
+        A 202 means the request was accepted, **not** that a clip exists. The
+        caller must confirm with `get_clip` before treating it as real.
+        """
+        response = self._send(
+            "POST",
+            HELIX_BASE_URL + "/clips",
+            headers={
+                "Client-Id": self.credentials.client_id,
+                "Authorization": f"Bearer {access_token}",
+            },
+            # Twitch takes the broadcaster as a query parameter, not a body.
+            params={"broadcaster_id": broadcaster_id},
+        )
+
+        # 403 here means the channel does not permit this clip, which is a
+        # restriction rather than a credentials problem, so it must not be
+        # mistaken for an expired token.
+        self._raise_for_status(response, auth_statuses=(401,))
+
+        if response.status_code != CLIP_ACCEPTED_STATUS:
+            raise TwitchAPIError(
+                f"Twitch did not accept the clip request (HTTP {response.status_code}).",
+                status_code=response.status_code,
+            )
+
+        payload = self._decode(response)
+        entries = payload.get("data")
+        if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+            raise TwitchAPIError("Twitch returned an unexpected clip request payload.")
+
+        clip_id = str(entries[0].get("id") or "")
+        if not clip_id:
+            raise TwitchAPIError("Twitch accepted the clip request but returned no clip id.")
+
+        logger.info("Twitch accepted a clip request for broadcaster_user_id=%s.", broadcaster_id)
+        # `edit_url` is present in entries[0] and is deliberately not read.
+        return TwitchClipRequest(clip_id=clip_id)
+
+    def get_clip(self, clip_id: str, *, access_token: str) -> TwitchClip | None:
+        """Look up a clip by id.
+
+        Returns None for a successful response with an empty `data` list, which
+        is how Twitch reports that the clip does not exist *yet*. That is not a
+        failure: clip creation is asynchronous, so absence means "not ready".
+        """
+        payload = self.helix_get("clips", access_token=access_token, params={"id": clip_id})
+        entries = payload.get("data")
+        if not isinstance(entries, list):
+            raise TwitchAPIError("Twitch returned an unexpected clips payload.")
+        if not entries:
+            return None
+        return clip_from_helix_entry(entries[0])
 
     def create_chat_message_subscription(
         self,

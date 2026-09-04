@@ -2,6 +2,7 @@
 
 import { useCallback, useState, type FormEvent } from "react";
 
+import { LiveStatus } from "@/components/live-status";
 import { ApiError, resolveStreamer, type Streamer } from "@/lib/api";
 
 type ResolveState =
@@ -99,42 +100,48 @@ export function StreamerResolver() {
       )}
 
       {state.kind === "resolved" && (
-        <div className="flex items-start gap-4 rounded-md border border-border bg-background p-4">
-          {state.streamer.profile_image_url && (
-            // A plain <img>: the URL is Twitch's own CDN and is never proxied,
-            // downloaded or re-hosted by ClipperStash.
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={state.streamer.profile_image_url}
-              alt=""
-              width={56}
-              height={56}
-              className="size-14 shrink-0 rounded-full object-cover"
-            />
-          )}
-          <div className="min-w-0 space-y-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="font-medium">
-                {state.streamer.display_name || state.streamer.username}
-              </p>
-              <BroadcasterBadge type={state.streamer.broadcaster_type} />
+        <div className="space-y-4 rounded-md border border-border bg-background p-4">
+          <div className="flex items-start gap-4">
+            {state.streamer.profile_image_url && (
+              // A plain <img>: the URL is Twitch's own CDN and is never proxied,
+              // downloaded or re-hosted by ClipperStash.
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={state.streamer.profile_image_url}
+                alt=""
+                width={56}
+                height={56}
+                className="size-14 shrink-0 rounded-full object-cover"
+              />
+            )}
+            <div className="min-w-0 space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="font-medium">
+                  {state.streamer.display_name || state.streamer.username}
+                </p>
+                <BroadcasterBadge type={state.streamer.broadcaster_type} />
+              </div>
+              <p className="text-sm text-muted">@{state.streamer.username}</p>
+              <a
+                href={state.streamer.channel_url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="inline-block text-sm underline underline-offset-2"
+              >
+                View on Twitch
+              </a>
             </div>
-            <p className="text-sm text-muted">@{state.streamer.username}</p>
-            <a
-              href={state.streamer.channel_url}
-              target="_blank"
-              rel="noreferrer noopener"
-              className="inline-block text-sm underline underline-offset-2"
-            >
-              View on Twitch
-            </a>
           </div>
+
+          {/* Keyed on the streamer, so resolving a different channel starts
+              from an unchecked state rather than showing the previous result. */}
+          <LiveStatus key={state.streamer.id} streamerId={state.streamer.id} />
         </div>
       )}
 
       <p className="text-sm text-muted">
-        Paste a Twitch channel URL or username. Monitoring the channel is not
-        implemented yet.
+        Paste a Twitch channel URL or username. Live status is checked only when
+        you ask; continuous monitoring is not implemented yet.
       </p>
     </section>
   );

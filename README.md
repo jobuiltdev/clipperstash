@@ -7,10 +7,12 @@ Twitch clips and collects them in one dashboard. See
 [`docs/architecture.md`](docs/architecture.md) for the product objective, the
 current architecture and the planned pipeline.
 
-**Status:** foundation, the Twitch API and OAuth layer, and streamer
-resolution. A Twitch channel URL or username can be resolved to a stored
-streamer; monitoring, detection and clipping are not implemented yet — those
-stages are listed as `NOT IMPLEMENTED` in the architecture document.
+**Status:** foundation, the Twitch API and OAuth layer, streamer resolution,
+and on-demand live/offline observation. A Twitch channel can be resolved and
+checked for a live broadcast, which opens and closes a stream session. Chat
+ingestion, moment detection and clipping are not implemented yet, and there is
+no recurring monitoring — those stages are listed as `NOT IMPLEMENTED` in the
+architecture document.
 
 ## Repository layout
 
@@ -158,16 +160,20 @@ The application runs at http://localhost:3000. Point it elsewhere by setting
 `NEXT_PUBLIC_API_BASE_URL` in `web/.env.local`.
 
 The page offers three things: a streamer box where a Twitch channel URL or
-username resolves to a stored streamer, the Twitch connection control from the
-previous milestone, and a backend reachability indicator driven by
-`GET /api/health/`.
+username resolves to a stored streamer and can then be checked for a live
+broadcast, the Twitch connection control from an earlier milestone, and a
+backend reachability indicator driven by `GET /api/health/`.
+
+The live check runs only when the button is pressed. A failed check is shown as
+"Status unknown", distinct from "Offline".
 
 ## API
 
-| Method | Path                            | Purpose                                     |
-| ------ | ------------------------------- | ------------------------------------------- |
-| `GET`  | `/api/health/`                  | Liveness check                              |
-| `POST` | `/api/streamers/resolve/`       | Resolve a Twitch channel URL or username    |
+| Method | Path                             | Purpose                                     |
+| ------ | -------------------------------- | ------------------------------------------- |
+| `GET`  | `/api/health/`                   | Liveness check                              |
+| `POST` | `/api/streamers/resolve/`        | Resolve a Twitch channel URL or username    |
+| `POST` | `/api/streamers/<id>/observe/`   | Check whether that streamer is live now     |
 | `GET`  | `/api/twitch/oauth/start/`      | Begins the Twitch Authorization Code flow   |
 | `GET`  | `/api/twitch/oauth/callback/`   | Twitch redirect target; exchanges the code  |
 | `GET`  | `/api/twitch/connection/`       | Safe status of the connected Twitch account |
@@ -201,6 +207,52 @@ Resolution uses the backend's **app access token**, so it works whether or not a
 Twitch account has been connected — connecting is only needed for actions taken
 on an operator's behalf later. The backend never fetches the URL you submit: it
 parses out the channel name and asks Twitch's Helix API directly.
+
+### Checking live status
+
+Take the `id` from a resolve response and ask whether that channel is broadcasting:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/streamers/1/observe/
+```
+
+While live:
+
+```json
+{
+  "status": "live",
+  "streamer": { "id": 1, "username": "shroud", "display_name": "shroud" },
+  "stream": {
+    "session_id": 10,
+    "platform_stream_id": "41375541868",
+    "started_at": "2026-09-04T09:00:00Z",
+    "title": "Ranked grind",
+    "category_id": "509658",
+    "category_name": "Just Chatting",
+    "language": "en",
+    "viewer_count": 1200,
+    "is_mature": false
+  }
+}
+```
+
+While offline, `status` is `"offline"` and `stream` is `null`.
+
+| Outcome                        | Status | `error.code`              |
+| ------------------------------ | ------ | ------------------------- |
+| Live or offline determined      | 200    | —                         |
+| Streamer id not resolved        | 404    | `streamer_not_found`      |
+| Twitch unconfigured             | 503    | `twitch_not_configured`   |
+| State could not be determined   | 503    | `stream_state_unavailable` |
+
+A 503 is **not** an offline answer. If Twitch times out, errors, or replies with
+something unreadable, ClipperStash reports that it does not know and leaves any
+open session exactly as it was. Only a successful Twitch response containing no
+stream closes a session.
+
+Each request is one check. There is no background polling and no scheduler; how
+continuous monitoring should be driven is deferred until chat ingestion is
+designed.
 
 ## Checks
 

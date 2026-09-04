@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import httpx
 from django.conf import settings
+from django.utils.dateparse import parse_datetime
 
 from apps.twitch.exceptions import (
     TwitchAPIError,
@@ -105,6 +107,95 @@ class TwitchIdentity:
     profile_image_url: str = ""
     broadcaster_type: str = ""
     description: str = ""
+
+
+@dataclass(frozen=True)
+class TwitchStream:
+    """A live broadcast as returned by `GET /helix/streams`.
+
+    `stream_id` is Twitch's identity for one broadcast and is what ClipperStash
+    uses to tell one session apart from the next. `started_at` is Twitch's own
+    authoritative broadcast start, always timezone-aware.
+    """
+
+    stream_id: str
+    user_id: str
+    user_login: str
+    user_name: str
+    game_id: str
+    game_name: str
+    stream_type: str
+    title: str
+    viewer_count: int
+    started_at: datetime
+    language: str
+    thumbnail_url: str
+    is_mature: bool
+
+
+def stream_from_helix_entry(entry: Any, *, expected_user_id: str | None = None) -> TwitchStream:
+    """Build a stream from one `GET /helix/streams` entry.
+
+    Anything that is not a usable live-stream object raises, rather than being
+    reported as "not live": a payload we cannot read means the stream state is
+    unknown, which is a different thing from the broadcaster being offline.
+    """
+    if not isinstance(entry, dict):
+        raise TwitchAPIError("Twitch returned an unexpected stream object.")
+
+    stream_id = str(entry.get("id") or "")
+    user_id = str(entry.get("user_id") or "")
+    if not stream_id or not user_id:
+        raise TwitchAPIError("Twitch returned a stream without an id or user id.")
+
+    if expected_user_id is not None and user_id != expected_user_id:
+        raise TwitchAPIError("Twitch returned a stream belonging to a different broadcaster.")
+
+    # Twitch marks live broadcasts as "live". Any other value is a shape this
+    # milestone does not model, so it is treated as unreadable rather than
+    # quietly accepted as a live broadcast.
+    stream_type = str(entry.get("type") or "")
+    if stream_type != "live":
+        raise TwitchAPIError("Twitch returned a stream that is not marked live.")
+
+    started_at = parse_started_at(entry.get("started_at"))
+
+    viewer_count = entry.get("viewer_count")
+    if not isinstance(viewer_count, int) or isinstance(viewer_count, bool) or viewer_count < 0:
+        raise TwitchAPIError("Twitch returned a stream without a usable viewer count.")
+
+    return TwitchStream(
+        stream_id=stream_id,
+        user_id=user_id,
+        user_login=str(entry.get("user_login") or ""),
+        user_name=str(entry.get("user_name") or ""),
+        game_id=str(entry.get("game_id") or ""),
+        game_name=str(entry.get("game_name") or ""),
+        stream_type=stream_type,
+        title=str(entry.get("title") or ""),
+        viewer_count=viewer_count,
+        started_at=started_at,
+        language=str(entry.get("language") or ""),
+        thumbnail_url=str(entry.get("thumbnail_url") or ""),
+        is_mature=bool(entry.get("is_mature")),
+    )
+
+
+def parse_started_at(value: Any) -> datetime:
+    """Parse Twitch's broadcast start into a timezone-aware datetime.
+
+    A start time we cannot read makes the whole observation unusable. The local
+    clock is never substituted: only Twitch knows when the broadcast began.
+    """
+    if not isinstance(value, str) or not value:
+        raise TwitchAPIError("Twitch returned a stream without a start time.")
+    try:
+        parsed = parse_datetime(value)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.tzinfo is None:
+        raise TwitchAPIError("Twitch returned an unreadable stream start time.")
+    return parsed
 
 
 def identity_from_helix_user(entry: Any) -> TwitchIdentity:
@@ -331,6 +422,23 @@ class TwitchClient:
         if not isinstance(entries, list) or not entries:
             raise TwitchAPIError("Twitch returned no user for the supplied access token.")
         return identity_from_helix_user(entries[0])
+
+    def get_stream_by_user_id(self, user_id: str, *, access_token: str) -> TwitchStream | None:
+        """Look up the broadcaster's current live stream.
+
+        The user id travels as a query parameter and carries no credential.
+        Returns None only when Twitch answers successfully with an empty `data`
+        list, which is how it reports that the broadcaster is not live. Every
+        other outcome raises, so "could not determine" is never mistaken for
+        "offline".
+        """
+        payload = self.helix_get("streams", access_token=access_token, params={"user_id": user_id})
+        entries = payload.get("data")
+        if not isinstance(entries, list):
+            raise TwitchAPIError("Twitch returned an unexpected streams payload.")
+        if not entries:
+            return None
+        return stream_from_helix_entry(entries[0], expected_user_id=user_id)
 
     def get_user_by_login(self, login: str, *, access_token: str) -> TwitchIdentity | None:
         """Look up a public Twitch account by login.

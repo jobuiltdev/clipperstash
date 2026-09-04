@@ -18,6 +18,7 @@ from apps.twitch.client import (
     TokenValidation,
     TwitchClient,
     TwitchIdentity,
+    TwitchStream,
 )
 from apps.twitch.exceptions import TwitchAuthenticationError
 from apps.twitch.models import TwitchConnection
@@ -83,6 +84,31 @@ def lookup_user_by_login(
 
     token = get_app_access_token(client=client, force_refresh=True)
     return client.get_user_by_login(login, access_token=token)
+
+
+def lookup_stream_by_user_id(
+    user_id: str, *, client: TwitchClient | None = None
+) -> TwitchStream | None:
+    """Ask Twitch whether a broadcaster is live, using an app access token.
+
+    Like the user lookup, this is app-level data and deliberately does not
+    require a connected operator's OAuth token, nor any additional scope.
+
+    Returns None only for a successful response with no stream, which means the
+    broadcaster is not live. Every failure raises, so a caller can never read an
+    error as an offline observation. A cached app token that Twitch rejects is
+    minted once more and the lookup retried exactly once.
+    """
+    client = client or TwitchClient()
+    try:
+        return client.get_stream_by_user_id(
+            user_id, access_token=get_app_access_token(client=client)
+        )
+    except TwitchAuthenticationError:
+        logger.info("Twitch rejected the app access token; minting a new one and retrying once.")
+
+    token = get_app_access_token(client=client, force_refresh=True)
+    return client.get_stream_by_user_id(user_id, access_token=token)
 
 
 @transaction.atomic

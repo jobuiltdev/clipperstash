@@ -56,11 +56,23 @@ Twitch request.
 - Persistence of the resolved account as a `Streamer`, idempotently.
 - `POST /api/streamers/resolve/` and a minimal frontend form.
 
-This establishes *who* a channel is. Nothing observes what it is doing.
+This establishes *who* a channel is.
+
+**Milestone 3 — live observation and stream sessions. IMPLEMENTED.**
+
+- On-demand live/offline observation through Twitch `GET /helix/streams`.
+- `StreamSession` lifecycle: opened on a live observation, closed on an offline
+  one, with database-enforced single-live-session and unique-stream invariants.
+- Explicit separation of "offline" from "could not determine".
+- `POST /api/streamers/<id>/observe/` and a minimal frontend control.
+
+This establishes *whether* a channel is broadcasting, one check at a time.
+Nothing drives those checks on a schedule.
 
 Explicitly still out of scope:
 
-- Live/offline detection, `GET /helix/streams` and stream sessions.
+- Any recurring monitoring: no Celery Beat, no polling loop, no cron.
+- Twitch EventSub, including `stream.online` / `stream.offline`.
 - Twitch EventSub subscriptions and chat ingestion.
 - Moment scoring or detection.
 - Clip creation, clip download or any media handling.
@@ -95,13 +107,14 @@ the health view and the Celery application. Product code lives under
 | ------------ | ----------------------------------------------------------- | ----------------------- |
 | `streamers`  | Streamer identity, resolution from a URL, stored channels    | IMPLEMENTED (see below) |
 | `twitch`     | Twitch API client, OAuth and credential handling             | IMPLEMENTED (see below) |
-| `monitoring` | Stream sessions and realtime signal ingestion                | NOT IMPLEMENTED         |
+| `monitoring` | Stream sessions and realtime signal ingestion                | PARTIAL (see below)     |
 | `moments`    | Moment scoring and interesting-moment detection              | NOT IMPLEMENTED         |
 | `clips`      | Clip records, clip creation and the dashboard's read models  | NOT IMPLEMENTED         |
 
 Twitch EventSub and chat ingestion will also live in `twitch`, and are NOT
-IMPLEMENTED. `monitoring`, `moments` and `clips` still contain only their
-`AppConfig` and an empty `models` module.
+IMPLEMENTED. `monitoring` owns the stream-session half of its remit; realtime
+signal ingestion within it is NOT IMPLEMENTED. `moments` and `clips` still
+contain only their `AppConfig` and an empty `models` module.
 
 ### Twitch integration
 
@@ -266,12 +279,85 @@ not track username history, so if a stored login turns out to belong to a
 different account the clash surfaces as a 409 rather than one record silently
 adopting another's identity.
 
+### Live observation and stream sessions
+
+`backend/apps/monitoring/` owns the observation lifecycle. As with `streamers`,
+it builds no Twitch requests of its own.
+
+| Module           | Responsibility                                           |
+| ---------------- | -------------------------------------------------------- |
+| `services.py`    | `observe_streamer()` and every lifecycle rule             |
+| `models.py`      | `StreamSession`                                           |
+| `serializers.py` | The safe live/offline representation                      |
+| `exceptions.py`  | `StreamStateUnavailableError`                             |
+| `views.py`       | `POST /api/streamers/<id>/observe/`                       |
+
+**Lookup.** `twitch.services.lookup_stream_by_user_id()` calls
+`GET /helix/streams?user_id=<id>` with an **app access token** from the
+Milestone 1 Client Credentials cache. No connected-operator OAuth token is
+involved and no additional scope is requested, so live checks work with no
+Twitch account connected. The streamer's stored `platform_user_id` is used
+directly — a live check never re-resolves the channel through Get Users. A
+cached app token that Twitch rejects is minted once more and the lookup retried
+exactly once.
+
+**Session identity.** Twitch's `stream.id` is the identity of a broadcast.
+`started_at` is Twitch's own authoritative value, parsed as timezone-aware UTC;
+a start time that cannot be read makes the whole observation unusable rather
+than being replaced with the local clock. `viewer_count`, `title`, `game_id`,
+`game_name`, `language` and `is_mature` are persisted; `thumbnail_url` and tags
+are parsed but deliberately not stored, and no follower counts or unrelated
+broadcaster metadata are collected.
+
+**Lifecycle.**
+
+| Observation | Effect |
+| ----------- | ------ |
+| Live, no session for that stream id | Open a `StreamSession`, status `LIVE` |
+| Live, same stream id | Reuse the session; refresh title, category, language, maturity, viewer count and `last_observed_at`; leave `started_at` untouched |
+| Live, different stream id while one is live | Close the older session, then open or reuse the session for the new stream id |
+| Offline (successful response, empty `data`) | Close the live session, if any |
+| Offline with no live session | Do nothing |
+
+Repeat observations are idempotent: a live check returns the same session, and a
+second offline check leaves the already-recorded `ended_at` alone.
+
+`Streamer` carries no live flag. An active session *is* the representation of an
+active broadcast.
+
+**`ended_at` is an observation, not a broadcast end.** Get Streams reports only
+that a broadcaster is no longer live; it does not say when they stopped. So
+`ended_at` records when ClipperStash *observed* the stream to be over, and is
+only as precise as the gap between checks. It is never presented as Twitch's
+exact end time.
+
+**Offline is not the same as unknown.** Only a successful Twitch response with
+no stream counts as an offline observation. A timeout, a 5xx, an authentication
+failure, a malformed payload, a stream belonging to another broadcaster, or a
+stream not marked `live` all raise `StreamStateUnavailableError` — the API
+answers `503 stream_state_unavailable`, and **no session state is changed**.
+"Could not determine" is never allowed to close a broadcast.
+
+**Concurrency.** Two invariants are enforced by the database rather than by
+application code: `platform_stream_id` is unique, and a partial unique
+constraint permits at most one `LIVE` session per streamer while allowing any
+number of ended ones. During a live observation the streamer row is locked with
+`SELECT ... FOR UPDATE` inside a transaction, so two near-simultaneous checks of
+the same channel are serialized; the constraint is the backstop if they are not.
+No distributed lock is introduced.
+
+**No scheduler.** Every check is explicitly requested. There is no Celery Beat
+entry, periodic task or polling loop, and a test asserts the beat schedule is
+empty. Choosing a monitoring cadence is deferred until the chat-ingestion
+architecture is known.
+
 ### API surface
 
 | Method | Path                          | Notes                                              |
 | ------ | ----------------------------- | -------------------------------------------------- |
 | `GET`  | `/api/health/`                | Fixed `{"status": "ok"}`; exposes no configuration  |
 | `POST` | `/api/streamers/resolve/`     | Resolves input to a persisted streamer              |
+| `POST` | `/api/streamers/<id>/observe/` | One live/offline check; 503 when undeterminable    |
 | `GET`  | `/api/twitch/oauth/start/`    | Redirects to Twitch; carries no secret              |
 | `GET`  | `/api/twitch/oauth/callback/` | Exchanges the code, then redirects to the frontend  |
 | `GET`  | `/api/twitch/connection/`     | Connection status; carries no token material        |
@@ -292,7 +378,8 @@ reaches the browser, its URL, its storage or its JavaScript state.
 ### Data and messaging
 
 - **PostgreSQL** is the primary datastore. The product tables are
-  `twitch_twitchconnection` and `streamers_streamer`.
+  `twitch_twitchconnection`, `streamers_streamer` and
+  `monitoring_streamsession`.
 - **Redis** is the Celery broker and result backend, and also backs Django's
   cache, which holds the app access token and in-flight OAuth state.
 - **Celery** is configured in `backend/clipperstash/celery.py` and exposes a
@@ -310,8 +397,12 @@ client in `web/src/lib/api.ts`. The backend base URL comes from
 
 The streamer box posts to `/api/streamers/resolve/` and renders the resolved
 account: profile image, display name, `@username`, broadcaster type and a link
-to the channel. It is not gated on the Twitch connection, because resolution
-runs on the backend's app token.
+to the channel. A resolved streamer gains a "Check live status" control that
+posts to `/api/streamers/<id>/observe/` once per press and renders live (with
+title, category, viewer count and start time), offline, or — for a 503 — a
+distinct "Status unknown" message. Neither control is gated on the Twitch
+connection, because both run on the backend's app token. There is no polling and
+no timer.
 
 The Twitch section reads `GET /api/twitch/connection/` and offers a link to
 `/api/twitch/oauth/start/`. It is a plain navigation, so the OAuth exchange
@@ -328,7 +419,9 @@ framework and no animation library.
 ```
 Twitch API access / OAuth         IMPLEMENTED
   -> streamer resolution          IMPLEMENTED
-  -> stream / chat monitoring     NOT IMPLEMENTED
+  -> live / offline observation   IMPLEMENTED
+  -> recurring monitoring         NOT IMPLEMENTED
+  -> chat ingestion               NOT IMPLEMENTED
   -> moment scoring               NOT IMPLEMENTED
   -> Twitch clip                  NOT IMPLEMENTED
   -> ClipperStash dashboard       NOT IMPLEMENTED
@@ -339,8 +432,9 @@ Expanded, the V0 target pipeline is expected to become:
 ```
 Streamer URL                      IMPLEMENTED
   -> streamer resolution          IMPLEMENTED
-  -> live / offline detection     NOT IMPLEMENTED
-  -> stream session               NOT IMPLEMENTED
+  -> live / offline detection     IMPLEMENTED (on demand)
+  -> stream session               IMPLEMENTED
+  -> recurring monitoring         NOT IMPLEMENTED
   -> realtime Twitch chat ingestion   NOT IMPLEMENTED
   -> moment scoring               NOT IMPLEMENTED
   -> interesting moment detection NOT IMPLEMENTED
@@ -365,8 +459,8 @@ use. It is not part of the current milestone and no media tooling is installed.
 
 The pieces already in place map onto the pipeline as follows: the `twitch` app
 owns API access and credentials today and will own EventSub and chat ingestion,
-`streamers` owns channel identity today, `monitoring` will own live detection and
-session state, `moments` will own scoring, and `clips` will own clip records and
-the dashboard's read side. Clip creation will use the `clips:edit` scope already
+`streamers` owns channel identity today, `monitoring` owns live detection and
+session state today and will own realtime signal ingestion, `moments` will own
+scoring, and `clips` will own clip records and the dashboard's read side. Clip creation will use the `clips:edit` scope already
 being requested, and will act on a `Streamer` that has already been resolved. Long-running and scheduled work will run on the existing
 Celery worker against Redis, and all durable state will live in PostgreSQL.

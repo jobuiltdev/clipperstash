@@ -127,3 +127,37 @@ export function resolveStreamer(input: string): Promise<ResolveStreamerResponse>
     body: JSON.stringify({ input }),
   });
 }
+
+
+export type ObservedStream = {
+  session_id: number;
+  platform_stream_id: string;
+  started_at: string;
+  title: string;
+  category_id: string;
+  category_name: string;
+  language: string;
+  viewer_count: number;
+  is_mature: boolean;
+};
+
+/**
+ * The result of one live check.
+ *
+ * There is deliberately no "unknown" status: when the backend cannot determine
+ * the state it returns an error instead, so a failed check can never be
+ * rendered as "offline".
+ */
+export type ObservationResponse = {
+  status: "live" | "offline";
+  streamer: { id: number; username: string; display_name: string };
+  stream: ObservedStream | null;
+};
+
+/** Ask the backend to check a resolved streamer's live state, once. */
+export function observeStreamer(streamerId: number): Promise<ObservationResponse> {
+  return request<ObservationResponse>(`/api/streamers/${streamerId}/observe/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+}

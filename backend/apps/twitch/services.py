@@ -63,6 +63,28 @@ def clear_app_access_token() -> None:
     cache.delete(APP_TOKEN_CACHE_KEY)
 
 
+def lookup_user_by_login(
+    login: str, *, client: TwitchClient | None = None
+) -> TwitchIdentity | None:
+    """Resolve a public Twitch account by login, using an app access token.
+
+    Public identity is app-level data, so this deliberately does not require a
+    connected user's OAuth token: streamer resolution works whether or not an
+    operator has authorized their own Twitch account.
+
+    A cached app token that Twitch rejects is minted once more and the lookup
+    retried exactly once. A second rejection propagates, so the cycle is bounded.
+    """
+    client = client or TwitchClient()
+    try:
+        return client.get_user_by_login(login, access_token=get_app_access_token(client=client))
+    except TwitchAuthenticationError:
+        logger.info("Twitch rejected the app access token; minting a new one and retrying once.")
+
+    token = get_app_access_token(client=client, force_refresh=True)
+    return client.get_user_by_login(login, access_token=token)
+
+
 @transaction.atomic
 def store_connection(
     *,

@@ -6,5 +6,6 @@ from clipperstash.health import health
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/health/", health, name="health"),
+    path("api/streamers/", include("apps.streamers.urls")),
     path("api/twitch/", include("apps.twitch.urls")),
 ]

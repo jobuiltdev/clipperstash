@@ -93,11 +93,42 @@ class TokenValidation:
 
 @dataclass(frozen=True)
 class TwitchIdentity:
-    """The Twitch account represented by a user access token."""
+    """A Twitch account as returned by `GET /helix/users`.
+
+    Only the fields ClipperStash actually uses are modelled; the rest of Twitch's
+    user payload is deliberately dropped rather than carried around.
+    """
 
     user_id: str
     login: str
     display_name: str
+    profile_image_url: str = ""
+    broadcaster_type: str = ""
+    description: str = ""
+
+
+def identity_from_helix_user(entry: Any) -> TwitchIdentity:
+    """Build an identity from one `GET /helix/users` entry.
+
+    A payload that is not a usable user object is an integration error rather
+    than a "no such user" result, so it raises instead of returning None.
+    """
+    if not isinstance(entry, dict):
+        raise TwitchAPIError("Twitch returned an unexpected user object.")
+
+    user_id = str(entry.get("id") or "")
+    login = str(entry.get("login") or "")
+    if not user_id or not login:
+        raise TwitchAPIError("Twitch returned a user without an id or login.")
+
+    return TwitchIdentity(
+        user_id=user_id,
+        login=login,
+        display_name=str(entry.get("display_name") or ""),
+        profile_image_url=str(entry.get("profile_image_url") or ""),
+        broadcaster_type=str(entry.get("broadcaster_type") or ""),
+        description=str(entry.get("description") or ""),
+    )
 
 
 def normalize_scopes(payload: Any) -> tuple[str, ...]:
@@ -299,9 +330,20 @@ class TwitchClient:
         entries = payload.get("data")
         if not isinstance(entries, list) or not entries:
             raise TwitchAPIError("Twitch returned no user for the supplied access token.")
-        user = entries[0]
-        return TwitchIdentity(
-            user_id=str(user.get("id", "")),
-            login=str(user.get("login", "")),
-            display_name=str(user.get("display_name", "")),
-        )
+        return identity_from_helix_user(entries[0])
+
+    def get_user_by_login(self, login: str, *, access_token: str) -> TwitchIdentity | None:
+        """Look up a public Twitch account by login.
+
+        The login travels as a query parameter, which is safe: it has already
+        been validated as a bare Twitch login and carries no credential. Returns
+        None when Twitch answers successfully with an empty `data` list, which is
+        how it reports "no such user".
+        """
+        payload = self.helix_get("users", access_token=access_token, params={"login": login})
+        entries = payload.get("data")
+        if not isinstance(entries, list):
+            raise TwitchAPIError("Twitch returned an unexpected users payload.")
+        if not entries:
+            return None
+        return identity_from_helix_user(entries[0])

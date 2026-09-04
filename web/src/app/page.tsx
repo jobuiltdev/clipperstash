@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { StreamerResolver } from "@/components/streamer-resolver";
 import { TwitchConnection } from "@/components/twitch-connection";
 import { API_BASE_URL, getHealth } from "@/lib/api";
 
@@ -68,34 +69,7 @@ export default function Home() {
         </p>
       </header>
 
-      <section
-        aria-labelledby="workflow-heading"
-        className="space-y-3 rounded-lg border border-border bg-surface p-5"
-      >
-        <h2 id="workflow-heading" className="text-sm font-medium">
-          Streamer
-        </h2>
-        <div className="flex flex-col gap-3 sm:flex-row">
-          <input
-            type="url"
-            disabled
-            aria-describedby="workflow-note"
-            placeholder="https://twitch.tv/your-streamer"
-            className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-muted disabled:cursor-not-allowed"
-          />
-          <button
-            type="button"
-            disabled
-            className="rounded-md border border-border px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Monitor
-          </button>
-        </div>
-        <p id="workflow-note" className="text-sm text-muted">
-          Streamer resolution and monitoring are not implemented yet. This input
-          is a placeholder for the planned workflow.
-        </p>
-      </section>
+      <StreamerResolver />
 
       <TwitchConnection />
 

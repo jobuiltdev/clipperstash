@@ -47,12 +47,20 @@ rather than stubbed in code.
   the flow.
 
 This is the plumbing only. It can authorize an account and make an authenticated
-Twitch request; it does not yet do anything with either.
+Twitch request.
+
+**Milestone 2 — streamer resolution. IMPLEMENTED.**
+
+- Normalization of a submitted Twitch channel URL or username to a login.
+- Resolution of that login through Twitch Helix `GET /helix/users`.
+- Persistence of the resolved account as a `Streamer`, idempotently.
+- `POST /api/streamers/resolve/` and a minimal frontend form.
+
+This establishes *who* a channel is. Nothing observes what it is doing.
 
 Explicitly still out of scope:
 
-- Streamer URL parsing and streamer resolution.
-- Live/offline detection and stream sessions.
+- Live/offline detection, `GET /helix/streams` and stream sessions.
 - Twitch EventSub subscriptions and chat ingestion.
 - Moment scoring or detection.
 - Clip creation, clip download or any media handling.
@@ -85,15 +93,15 @@ the health view and the Celery application. Product code lives under
 
 | App          | Responsibility                                              | Status                  |
 | ------------ | ----------------------------------------------------------- | ----------------------- |
-| `streamers`  | Streamer identity, resolution from a URL, stored channels    | NOT IMPLEMENTED         |
+| `streamers`  | Streamer identity, resolution from a URL, stored channels    | IMPLEMENTED (see below) |
 | `twitch`     | Twitch API client, OAuth and credential handling             | IMPLEMENTED (see below) |
 | `monitoring` | Stream sessions and realtime signal ingestion                | NOT IMPLEMENTED         |
 | `moments`    | Moment scoring and interesting-moment detection              | NOT IMPLEMENTED         |
 | `clips`      | Clip records, clip creation and the dashboard's read models  | NOT IMPLEMENTED         |
 
 Twitch EventSub and chat ingestion will also live in `twitch`, and are NOT
-IMPLEMENTED. Every app other than `twitch` still contains only its `AppConfig`
-and an empty `models` module.
+IMPLEMENTED. `monitoring`, `moments` and `clips` still contain only their
+`AppConfig` and an empty `models` module.
 
 ### Twitch integration
 
@@ -194,11 +202,76 @@ local `.env` file loaded when present. There is a single settings module; a
 larger per-environment hierarchy is not warranted at this size and can be
 introduced when a deployment target actually exists.
 
+### Streamer resolution
+
+`backend/apps/streamers/` owns streamer-domain behavior. It does not build Twitch
+requests: transport and authentication stay in the `twitch` app.
+
+| Module           | Responsibility                                            |
+| ---------------- | --------------------------------------------------------- |
+| `parsers.py`     | Pure normalization of submitted input to a Twitch login    |
+| `services.py`    | Resolution and idempotent persistence                      |
+| `models.py`      | The `Streamer` record                                      |
+| `serializers.py` | The request body and the safe public representation        |
+| `exceptions.py`  | `StreamerInputError`, `StreamerNotFoundError`, `StreamerConflictError` |
+| `views.py`       | `POST /api/streamers/resolve/`                             |
+
+**Normalization.** `parsers.py` performs no I/O. It accepts a bare login or a
+`twitch.tv` / `www.twitch.tv` channel URL over http or https, tolerating
+surrounding whitespace, a trailing slash and any casing, and produces a
+lower-cased login. It rejects other hosts, nested routes such as
+`/videos/123456`, a known set of Twitch site routes (`directory`, `settings`,
+`downloads`, `jobs`, `videos`, and similar), URLs carrying a query string or
+fragment, non-http schemes, non-default ports, and logins that cannot be valid.
+Host checks use `urllib.parse`, not string matching, so look-alikes like
+`twitch.tv.evil.example/name`, `evil.example/twitch.tv/name` and
+`twitch.tv@evil.example/name` are refused rather than resolved.
+
+Login syntax is checked conservatively: lowercase ASCII letters, digits and
+underscores, up to 25 characters. No minimum length is imposed. Twitch's current
+registration rules are not a guarantee about accounts that already exist, so a
+short but syntactically valid login is passed through to be looked up rather
+than refused locally. Local rules only reject what cannot be a login at all;
+Helix Get Users remains the authority on whether an account exists.
+
+**Lookup.** `twitch.services.lookup_user_by_login()` calls
+`GET /helix/users?login=<login>` with an **app access token** from the Milestone 1
+Client Credentials cache. Public channel identity is app-level data, so
+resolution deliberately does **not** require a connected operator's OAuth token
+and works with no Twitch account connected at all. An empty `data` array is
+Twitch's "no such user" and becomes a 404; a malformed payload is an integration
+error. A cached app token that Twitch rejects is minted once more and the lookup
+retried exactly once.
+
+**No outbound request to the submitted URL.** The submitted value is parsed for
+its host and path and then discarded. The backend never fetches it, never
+follows a redirect from it and never downloads the profile image; only Twitch's
+own OAuth and Helix hosts are contacted. That keeps a hostile submission from
+steering an outbound request.
+
+**Persistence.** `Streamer` records identity only — platform, the platform's
+account id, username, display name, canonical channel URL, profile image URL,
+broadcaster type, description and an active flag. Live status, titles,
+categories, viewer and follower counts are deliberately absent; they belong to
+stream monitoring. Two unique constraints apply: `(platform, platform_user_id)`
+and `(platform, username)`.
+
+**Idempotency.** Resolution matches on the platform account id, which is stable
+across renames, so resolving the same channel twice refreshes the existing row
+rather than creating a second one, and a renamed channel updates its stored
+username and canonical URL in place. Mutable profile fields — display name,
+profile image, broadcaster type, description — are refreshed on every
+resolution. Twitch does release abandoned logins for re-registration; V0 does
+not track username history, so if a stored login turns out to belong to a
+different account the clash surfaces as a 409 rather than one record silently
+adopting another's identity.
+
 ### API surface
 
 | Method | Path                          | Notes                                              |
 | ------ | ----------------------------- | -------------------------------------------------- |
 | `GET`  | `/api/health/`                | Fixed `{"status": "ok"}`; exposes no configuration  |
+| `POST` | `/api/streamers/resolve/`     | Resolves input to a persisted streamer              |
 | `GET`  | `/api/twitch/oauth/start/`    | Redirects to Twitch; carries no secret              |
 | `GET`  | `/api/twitch/oauth/callback/` | Exchanges the code, then redirects to the frontend  |
 | `GET`  | `/api/twitch/connection/`     | Connection status; carries no token material        |
@@ -218,8 +291,8 @@ reaches the browser, its URL, its storage or its JavaScript state.
 
 ### Data and messaging
 
-- **PostgreSQL** is the primary datastore. The only product table is
-  `twitch_twitchconnection`.
+- **PostgreSQL** is the primary datastore. The product tables are
+  `twitch_twitchconnection` and `streamers_streamer`.
 - **Redis** is the Celery broker and result backend, and also backs Django's
   cache, which holds the app access token and in-flight OAuth state.
 - **Celery** is configured in `backend/clipperstash/celery.py` and exposes a
@@ -235,11 +308,15 @@ section, and the live result of calling `GET /api/health/` through the typed
 client in `web/src/lib/api.ts`. The backend base URL comes from
 `NEXT_PUBLIC_API_BASE_URL`.
 
+The streamer box posts to `/api/streamers/resolve/` and renders the resolved
+account: profile image, display name, `@username`, broadcaster type and a link
+to the channel. It is not gated on the Twitch connection, because resolution
+runs on the backend's app token.
+
 The Twitch section reads `GET /api/twitch/connection/` and offers a link to
 `/api/twitch/oauth/start/`. It is a plain navigation, so the OAuth exchange
 happens entirely between the backend and Twitch and no credential is available
-to the frontend. The streamer input stays disabled: streamer resolution is a
-later milestone.
+to the frontend.
 
 There is no authentication, no routing beyond the single page, no component
 framework and no animation library.
@@ -250,6 +327,7 @@ framework and no animation library.
 
 ```
 Twitch API access / OAuth         IMPLEMENTED
+  -> streamer resolution          IMPLEMENTED
   -> stream / chat monitoring     NOT IMPLEMENTED
   -> moment scoring               NOT IMPLEMENTED
   -> Twitch clip                  NOT IMPLEMENTED
@@ -259,8 +337,8 @@ Twitch API access / OAuth         IMPLEMENTED
 Expanded, the V0 target pipeline is expected to become:
 
 ```
-Streamer URL                      NOT IMPLEMENTED
-  -> streamer resolution          NOT IMPLEMENTED
+Streamer URL                      IMPLEMENTED
+  -> streamer resolution          IMPLEMENTED
   -> live / offline detection     NOT IMPLEMENTED
   -> stream session               NOT IMPLEMENTED
   -> realtime Twitch chat ingestion   NOT IMPLEMENTED
@@ -287,7 +365,8 @@ use. It is not part of the current milestone and no media tooling is installed.
 
 The pieces already in place map onto the pipeline as follows: the `twitch` app
 owns API access and credentials today and will own EventSub and chat ingestion,
-`streamers` and `monitoring` will own resolution and session state, `moments`
-will own scoring, and `clips` will own clip records and the dashboard's read
-side. Clip creation will use the `clips:edit` scope already being requested. Long-running and scheduled work will run on the existing
+`streamers` owns channel identity today, `monitoring` will own live detection and
+session state, `moments` will own scoring, and `clips` will own clip records and
+the dashboard's read side. Clip creation will use the `clips:edit` scope already
+being requested, and will act on a `Streamer` that has already been resolved. Long-running and scheduled work will run on the existing
 Celery worker against Redis, and all durable state will live in PostgreSQL.

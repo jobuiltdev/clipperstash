@@ -7,10 +7,10 @@ Twitch clips and collects them in one dashboard. See
 [`docs/architecture.md`](docs/architecture.md) for the product objective, the
 current architecture and the planned pipeline.
 
-**Status:** foundation plus the Twitch API and OAuth layer. Authorizing a
-Twitch account and making authenticated Twitch requests work; none of the
-monitoring, detection or clipping pipeline is implemented yet — those stages are
-listed as `NOT IMPLEMENTED` in the architecture document.
+**Status:** foundation, the Twitch API and OAuth layer, and streamer
+resolution. A Twitch channel URL or username can be resolved to a stored
+streamer; monitoring, detection and clipping are not implemented yet — those
+stages are listed as `NOT IMPLEMENTED` in the architecture document.
 
 ## Repository layout
 
@@ -154,21 +154,53 @@ npm install
 npm run dev
 ```
 
-The application runs at http://localhost:3000 and reports whether it can reach
-`GET /api/health/` on the backend. Point it elsewhere by setting
+The application runs at http://localhost:3000. Point it elsewhere by setting
 `NEXT_PUBLIC_API_BASE_URL` in `web/.env.local`.
+
+The page offers three things: a streamer box where a Twitch channel URL or
+username resolves to a stored streamer, the Twitch connection control from the
+previous milestone, and a backend reachability indicator driven by
+`GET /api/health/`.
 
 ## API
 
-| Method | Path                            | Purpose                                   |
-| ------ | ------------------------------- | ----------------------------------------- |
-| `GET`  | `/api/health/`                  | Liveness check                            |
-| `GET`  | `/api/twitch/oauth/start/`      | Begins the Twitch Authorization Code flow |
-| `GET`  | `/api/twitch/oauth/callback/`   | Twitch redirect target; exchanges the code |
+| Method | Path                            | Purpose                                     |
+| ------ | ------------------------------- | ------------------------------------------- |
+| `GET`  | `/api/health/`                  | Liveness check                              |
+| `POST` | `/api/streamers/resolve/`       | Resolve a Twitch channel URL or username    |
+| `GET`  | `/api/twitch/oauth/start/`      | Begins the Twitch Authorization Code flow   |
+| `GET`  | `/api/twitch/oauth/callback/`   | Twitch redirect target; exchanges the code  |
 | `GET`  | `/api/twitch/connection/`       | Safe status of the connected Twitch account |
 
 None of these responses contain tokens, the client secret or an authorization
 code.
+
+### Resolving a streamer
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/streamers/resolve/ \
+  -H "Content-Type: application/json" \
+  -d '{"input": "https://www.twitch.tv/shroud"}'
+```
+
+Accepted input is a Twitch channel URL (`https://www.twitch.tv/name`,
+`twitch.tv/name`, with or without `www`, `http`, or a trailing slash) or a bare
+username. Input is trimmed and lower-cased. Twitch site pages such as
+`/directory`, `/settings` or `/videos/123` are rejected, as are other hosts.
+
+| Outcome                     | Status | `error.code`            |
+| --------------------------- | ------ | ----------------------- |
+| Resolved                    | 200    | —                       |
+| Not a Twitch channel input  | 400    | `invalid_streamer_input` |
+| No such Twitch account      | 404    | `streamer_not_found`    |
+| Username held by another id | 409    | `streamer_conflict`     |
+| Twitch unconfigured         | 503    | `twitch_not_configured` |
+| Twitch unreachable          | 503    | `twitch_unavailable`    |
+
+Resolution uses the backend's **app access token**, so it works whether or not a
+Twitch account has been connected — connecting is only needed for actions taken
+on an operator's behalf later. The backend never fetches the URL you submit: it
+parses out the channel name and asks Twitch's Helix API directly.
 
 ## Checks
 

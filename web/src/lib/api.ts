@@ -16,12 +16,29 @@ export type HealthResponse = {
 
 export class ApiError extends Error {
   readonly status: number;
+  /** Stable machine code from the backend, when it sent one. */
+  readonly code: string | null;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code: string | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
+}
+
+/** The error envelope the backend uses: `{ error: { code, message } }`. */
+type ErrorEnvelope = {
+  error?: { code?: unknown; message?: unknown };
+};
+
+function readErrorEnvelope(body: unknown): { code: string | null; message: string | null } {
+  const envelope = body as ErrorEnvelope | null;
+  const error = envelope?.error;
+  return {
+    code: typeof error?.code === "string" ? error.code : null,
+    message: typeof error?.message === "string" ? error.message : null,
+  };
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -32,7 +49,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new ApiError(`Request to ${path} failed`, response.status);
+    let code: string | null = null;
+    let message: string | null = null;
+    try {
+      ({ code, message } = readErrorEnvelope(await response.json()));
+    } catch {
+      // A non-JSON error body carries nothing useful; fall back to the status.
+    }
+    throw new ApiError(
+      message ?? `Request to ${path} failed`,
+      response.status,
+      code,
+    );
   }
 
   return (await response.json()) as T;
@@ -68,3 +96,34 @@ export function getTwitchConnection(): Promise<TwitchConnectionResponse> {
  * redirects on to Twitch, so no credential ever reaches the frontend.
  */
 export const TWITCH_OAUTH_START_URL = `${API_BASE_URL}/api/twitch/oauth/start/`;
+
+
+export type Streamer = {
+  id: number;
+  platform: string;
+  platform_user_id: string;
+  username: string;
+  display_name: string;
+  channel_url: string;
+  profile_image_url: string;
+  broadcaster_type: string;
+  description: string;
+};
+
+export type ResolveStreamerResponse = {
+  streamer: Streamer;
+};
+
+/**
+ * Resolve a Twitch channel URL or login.
+ *
+ * The value is sent to the backend, which parses it and asks Twitch. The
+ * frontend never contacts Twitch, and never fetches the submitted URL.
+ */
+export function resolveStreamer(input: string): Promise<ResolveStreamerResponse> {
+  return request<ResolveStreamerResponse>("/api/streamers/resolve/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input }),
+  });
+}

@@ -8,11 +8,12 @@ Twitch clips and collects them in one dashboard. See
 current architecture and the planned pipeline.
 
 **Status:** foundation, the Twitch API and OAuth layer, streamer resolution,
-on-demand live/offline observation, and chat ingestion for a live session. A
-Twitch channel can be resolved, checked for a live broadcast, and its chat read
-over an EventSub WebSocket into stored messages. Moment detection and clipping
-are not implemented yet, and nothing monitors anything on a schedule — those
-stages are listed as `NOT IMPLEMENTED` in the architecture document.
+on-demand live/offline observation, chat ingestion for a live session, and
+moment detection over the stored chat. A Twitch channel can be resolved, checked
+for a live broadcast, its chat read over an EventSub WebSocket, and that chat
+scored for clip-worthy moments. Clip creation is not implemented, and nothing
+runs on a schedule — those stages are listed as `NOT IMPLEMENTED` in the
+architecture document.
 
 ## Repository layout
 
@@ -319,6 +320,73 @@ for a short manual check.
 
 Messages missed while the connection was down are gone: Twitch does not replay
 chat, and ClipperStash does not guess at what it did not see.
+
+## Moment detection
+
+The detector scores a window of already-stored chat and records a
+`MomentCandidate` when it looks unusually clip-worthy. It creates no clips. Like
+chat monitoring it is run explicitly — there is no scheduler, and chat ingestion
+does not invoke it.
+
+```bash
+cd backend
+python manage.py detect_moments <session-id>
+```
+
+It prints the raw signals, each component score, the total, whether the activity
+gate passed and whether a candidate was recorded.
+
+| Option         | Effect                                                          |
+| -------------- | --------------------------------------------------------------- |
+| `--at <ISO>`   | Evaluate a past instant instead of now; must include a timezone   |
+| `--no-persist` | Score and report without recording anything                       |
+
+### Historical replay
+
+Because the evaluation time is explicit, a window can be re-scored exactly as it
+was, long after the broadcast ended:
+
+```bash
+python manage.py detect_moments 12 --at 2026-09-04T18:32:10Z
+```
+
+The session does not need to be live. This is how the thresholds below will be
+calibrated against real collected streams.
+
+### How a window is scored
+
+Two windows are compared, ending at the evaluation time `T`:
+
+```
+baseline: (T - 70s, T - 10s]      60 seconds
+current:  (T - 10s, T]            10 seconds
+```
+
+They abut exactly and never overlap, so a message on the shared boundary belongs
+to the baseline and is counted once.
+
+Five signals are each scaled to 0–1 and combined into a 0–100 total:
+
+| Component           | Weight | Reads                                                        |
+| ------------------- | ------ | ------------------------------------------------------------ |
+| `velocity`          | 0.40   | Current message rate against baseline, damped by low volume   |
+| `reaction`          | 0.20   | Share of messages using reaction language, times its breadth  |
+| `diversity`         | 0.15   | Distinct chatters per message, and absolute crowd size        |
+| `emote`             | 0.15   | Emotes per message and share of messages carrying any         |
+| `absolute_activity` | 0.10   | Raw message volume                                            |
+
+Two guards apply before anything is recorded:
+
+- **Activity gate** — at least 5 messages from at least 3 distinct chatters.
+  A quiet window never produces a candidate however it scores.
+- **Candidate threshold** — 70 on the 0–100 scale.
+
+After a candidate, the same session stays quiet for a **45-second cooldown**, so
+one burst produces one row rather than one per evaluation.
+
+All of these live in `backend/apps/moments/detector/config.py`. They are initial
+calibration values chosen to be explainable, not tuned ones, and are expected to
+move once real streams have been replayed.
 
 ## Checks
 

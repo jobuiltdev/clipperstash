@@ -80,13 +80,28 @@ Nothing drives those checks on a schedule.
   database-enforced deduplication.
 - A foreground `monitor_chat` management command.
 
+**Milestone 5 — moment detection. IMPLEMENTED.**
+
+- A pure detector over stored chat: two comparison windows, four signal
+  families, five weighted component scores and one total.
+- An activity gate, a candidate threshold and a per-session cooldown.
+- `MomentCandidate` persistence, recording the full working behind a finding.
+- A `detect_moments` management command, including historical replay.
+
+The detector decides *that* a moment happened. Acting on that — creating a clip
+— is not implemented.
+
 Explicitly still out of scope:
 
-- Any recurring monitoring or orchestration: no Celery Beat, no polling loop,
-  no cron, no supervisor. Chat runs only when a person starts it.
+- Any recurring monitoring, scheduling or orchestration: no Celery Beat, no
+  polling loop, no cron, no supervisor. Chat ingestion and detection each run
+  only when a person starts them, and neither invokes the other.
+- Twitch clip creation, retrieval or download.
 - EventSub webhooks and Conduits; `stream.online` / `stream.offline`.
 - Twitch IRC.
 - Multi-stream scaling: socket pools, worker coordination, leader election.
+- Any model inference: no LLM, no sentiment API, no embeddings, and no audio or
+  video analysis. Every signal is a count over text the pipeline already has.
 - Twitch EventSub subscriptions and chat ingestion.
 - Moment scoring or detection.
 - Clip creation, clip download or any media handling.
@@ -122,12 +137,13 @@ the health view and the Celery application. Product code lives under
 | `streamers`  | Streamer identity, resolution from a URL, stored channels    | IMPLEMENTED (see below) |
 | `twitch`     | Twitch API client, OAuth and credential handling             | IMPLEMENTED (see below) |
 | `monitoring` | Stream sessions and realtime signal ingestion                | IMPLEMENTED (see below) |
-| `moments`    | Moment scoring and interesting-moment detection              | NOT IMPLEMENTED         |
+| `moments`    | Moment scoring and interesting-moment detection              | IMPLEMENTED (see below) |
 | `clips`      | Clip records, clip creation and the dashboard's read models  | NOT IMPLEMENTED         |
 
 The EventSub transport lives in `twitch`, under `apps/twitch/eventsub/`;
-`monitoring` owns the chat domain that consumes it. `moments` and `clips` still
-contain only their `AppConfig` and an empty `models` module.
+`monitoring` owns the chat domain that consumes it, and `moments` owns detection
+over that chat. `clips` still contains only its `AppConfig` and an empty `models`
+module.
 
 ### Twitch integration
 
@@ -492,6 +508,109 @@ detector's shape is known:
 autonomous monitor orchestration   NOT IMPLEMENTED
 ```
 
+### Moment detection
+
+`backend/apps/moments/` scores the chat that ingestion stored. It is the only
+part of the pipeline with no external dependency at all: no network, no model,
+no service. Every signal is a count over data already in the database.
+
+| Module                  | Responsibility                                         |
+| ----------------------- | ------------------------------------------------------ |
+| `detector/config.py`    | Every window, weight, threshold and saturation point    |
+| `detector/window.py`    | `ChatSample`, window boundaries, splitting              |
+| `detector/signals.py`   | Counting, and the reaction lexicon                      |
+| `detector/scorer.py`    | Scaling counts into components and one total            |
+| `detector/detector.py`  | `score_samples()` and the `MomentScore` result          |
+| `services.py`           | Querying, cooldown, `MomentCandidate` persistence       |
+| `models.py`             | `MomentCandidate`                                       |
+
+**The detector is pure.** `score_samples()` takes chat samples and an explicit
+evaluation time and returns a score. It performs no I/O, reads no clock and
+never touches the ORM — it does not even see a `ChatMessage`, only a small
+`ChatSample` carrying the four fields scoring reads. The same inputs always
+produce the same answer, which is what makes replay and deterministic tests
+possible. Everything that touches the database lives in `services.py`.
+
+**Windows.** Two, ending at the evaluation time `T`, abutting exactly and never
+overlapping:
+
+```
+baseline: (T - 70s, T - 10s]      60 seconds
+current:  (T - 10s, T]            10 seconds
+```
+
+Both are half-open as `(start, end]`, and `baseline_end == current_start`, so a
+message landing precisely on the shared instant belongs to the baseline and to
+nothing else. A message at exactly `T` is current; one at exactly the baseline
+start falls outside both. Naive timestamps are refused rather than guessed at.
+
+**Signals.** Four families, all deterministic counts:
+
+- *Message velocity.* Current rate against baseline rate. The baseline rate is
+  floored, so silence yields a large but finite ratio rather than a division by
+  zero. The ratio is then multiplied by a confidence term scaled on current
+  volume — which is what stops "0 messages, then 1" reading as viral while "0
+  messages, then 30" still does.
+- *Unique chatter activity.* Distinct pseudonymous chatter hashes. Half the
+  score is participation (chatters per message, so one person sending everything
+  scores near zero) and half is absolute breadth.
+- *Emote intensity.* From Twitch's own fragment counts, stored during ingestion.
+  Half density, half coverage. No emote name is ever inspected.
+- *Reaction language.* A small rule-based lexicon of tokens and phrases, matched
+  against normalized whole tokens — never substrings, so "what" does not fire
+  inside "whatever". Deliberate elongation is collapsed for listed words only,
+  so "lollll" matches but "brrrr" is left alone. The reacting share is
+  multiplied by reaction breadth, so one person typing "LMAO" twenty times
+  cannot look like twenty people reacting once.
+
+**Score.** Each component is scaled into 0–1 against a saturation point, then
+weighted — velocity 0.40, reaction 0.20, diversity 0.15, emote 0.15, absolute
+activity 0.10 — and published on a 0–100 scale. The weights sum to 1.0 and a
+test asserts it. Every component is persisted alongside the total, so a
+surprising score can always be explained by which part produced it.
+
+**Two guards.** An activity gate (at least 5 messages from at least 3 distinct
+chatters) excludes windows too quiet to conclude anything from, whatever the
+arithmetic says; and a candidate threshold of 70 must then be cleared. A window
+is always scored, even when the gate fails, because the diagnostics are useful
+for calibration — only the verdict is withheld. After a candidate, a 45-second
+cooldown keeps one burst to one row; the boundary is inclusive, so exactly 45
+seconds later a new candidate may be recorded. Cooldown is a persistence
+concern, so the pure detector never learns about it.
+
+**All calibration is initial.** The windows, weights, saturation points,
+thresholds and cooldown are in `detector/config.py` as one frozen
+`DetectorConfig`, passed explicitly rather than read from globals. They were
+chosen to be explainable, not optimal, and are expected to move once real
+collected streams have been replayed.
+
+**What a candidate holds.** Aggregates only: the window boundaries, the raw
+counts for both windows, the five component scores and the total. No message
+text, no message ids, no chatter identities and no raw payload are copied into
+it, so a finding can be reviewed and recalibrated without carrying chat content
+forward. `status` is always `DETECTED`; the clip-related members exist on the
+column so it will not need migrating later, and nothing transitions to them.
+
+**Replay.** The evaluation time is a parameter all the way down, so a past
+window can be scored exactly as it was. The session's status is neither consulted
+nor changed — an ended broadcast can be re-scored from its stored chat, which is
+how threshold calibration will work.
+
+**Queries.** One bounded read over `(session, timestamp)` — the index added with
+chat ingestion — covering only the ~70 seconds both windows can contain, and
+only the four columns scoring reads. Chat outside that span is never loaded, so
+cost does not grow with the length of the broadcast. One further query checks
+the cooldown, and one inserts a candidate.
+
+**Runtime.** `manage.py detect_moments <session-id>`, optionally `--at <ISO>`
+for replay and `--no-persist` to score without recording. Run by a person.
+Nothing schedules it, and chat ingestion does not call it:
+
+```
+continuous detector scheduling        NOT IMPLEMENTED
+automatic invocation from EventSub    NOT IMPLEMENTED
+```
+
 ### API surface
 
 | Method | Path                          | Notes                                              |
@@ -520,8 +639,8 @@ reaches the browser, its URL, its storage or its JavaScript state.
 ### Data and messaging
 
 - **PostgreSQL** is the primary datastore. The product tables are
-  `twitch_twitchconnection`, `streamers_streamer`, `monitoring_streamsession`
-  and `monitoring_chatmessage`.
+  `twitch_twitchconnection`, `streamers_streamer`, `monitoring_streamsession`,
+  `monitoring_chatmessage` and `moments_momentcandidate`.
 - **Redis** is the Celery broker and result backend, and also backs Django's
   cache, which holds the app access token and in-flight OAuth state.
 - **Celery** is configured in `backend/clipperstash/celery.py` and exposes a
@@ -563,8 +682,8 @@ Twitch API access / OAuth         IMPLEMENTED
   -> streamer resolution          IMPLEMENTED
   -> live / offline observation   IMPLEMENTED
   -> chat ingestion               IMPLEMENTED (on demand)
+  -> moment scoring               IMPLEMENTED (on demand)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> moment scoring               NOT IMPLEMENTED
   -> Twitch clip                  NOT IMPLEMENTED
   -> ClipperStash dashboard       NOT IMPLEMENTED
 ```
@@ -577,9 +696,9 @@ Streamer URL                      IMPLEMENTED
   -> live / offline detection     IMPLEMENTED (on demand)
   -> stream session               IMPLEMENTED
   -> realtime Twitch chat ingestion   IMPLEMENTED (on demand)
+  -> moment scoring               IMPLEMENTED (on demand)
+  -> interesting moment detection IMPLEMENTED (on demand)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> moment scoring               NOT IMPLEMENTED
-  -> interesting moment detection NOT IMPLEMENTED
   -> Twitch clip creation         NOT IMPLEMENTED
   -> ClipperStash dashboard       NOT IMPLEMENTED
 ```
@@ -602,7 +721,7 @@ use. It is not part of the current milestone and no media tooling is installed.
 The pieces already in place map onto the pipeline as follows: the `twitch` app
 owns API access and credentials today and will own EventSub and chat ingestion,
 `streamers` owns channel identity, `monitoring` owns live detection, session
-state and chat ingestion, `moments` will own scoring over the stored chat, and
+state and chat ingestion, `moments` owns scoring over the stored chat, and
 `clips` will own clip records and the dashboard's read side. Clip creation will use the `clips:edit` scope already
 being requested, and will act on a `Streamer` that has already been resolved. Long-running and scheduled work will run on the existing
 Celery worker against Redis, and all durable state will live in PostgreSQL.

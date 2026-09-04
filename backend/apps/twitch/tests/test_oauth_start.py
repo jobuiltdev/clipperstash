@@ -25,18 +25,29 @@ def test_start_redirects_to_twitch(client):
     assert response["Location"].startswith(OAUTH_AUTHORIZE_URL)
 
 
-def test_start_requests_only_the_clips_edit_scope(client):
+def test_start_requests_exactly_the_required_scopes(client):
+    """Clip creation and chat reading, and nothing beyond them."""
     response = client.get(reverse("twitch:oauth-start"))
 
     scopes = authorization_query(response["Location"])["scope"][0].split(" ")
-    assert scopes == ["clips:edit"]
+    assert scopes == ["clips:edit", "user:read:chat"]
+    assert scopes == list(oauth.REQUIRED_SCOPES), "the request mirrors the declared set"
 
 
 def test_start_does_not_request_unrelated_scopes(client):
     response = client.get(reverse("twitch:oauth-start"))
 
     scope = authorization_query(response["Location"])["scope"][0]
-    for unrelated in ("user:read:email", "channel:read:subscriptions", "chat:read", "moderator"):
+    for unrelated in (
+        "user:read:email",
+        "channel:read:subscriptions",
+        "chat:read",
+        "chat:edit",
+        "user:write:chat",
+        "user:bot",
+        "channel:bot",
+        "moderator",
+    ):
         assert unrelated not in scope
 
 

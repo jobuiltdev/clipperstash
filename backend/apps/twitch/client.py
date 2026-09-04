@@ -33,6 +33,15 @@ OAUTH_AUTHORIZE_URL = "https://id.twitch.tv/oauth2/authorize"
 OAUTH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 OAUTH_VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
 
+# The only WebSocket endpoint ClipperStash ever dials by itself. The single
+# other address it may connect to is a `reconnect_url` handed over inside a
+# validated `session_reconnect` message on an existing Twitch socket; no URL
+# ever originates from user input.
+EVENTSUB_WEBSOCKET_URL = "wss://eventsub.wss.twitch.tv/ws"
+
+CHAT_MESSAGE_SUBSCRIPTION_TYPE = "channel.chat.message"
+CHAT_MESSAGE_SUBSCRIPTION_VERSION = "1"
+
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
 
@@ -107,6 +116,16 @@ class TwitchIdentity:
     profile_image_url: str = ""
     broadcaster_type: str = ""
     description: str = ""
+
+
+@dataclass(frozen=True)
+class EventSubSubscription:
+    """An EventSub subscription as Twitch reports it after creation."""
+
+    subscription_id: str
+    subscription_type: str
+    version: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -422,6 +441,73 @@ class TwitchClient:
         if not isinstance(entries, list) or not entries:
             raise TwitchAPIError("Twitch returned no user for the supplied access token.")
         return identity_from_helix_user(entries[0])
+
+    def helix_post(
+        self,
+        path: str,
+        *,
+        access_token: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Authenticated JSON POST against Helix, returning the decoded payload."""
+        endpoint = HELIX_BASE_URL + "/" + path.lstrip("/")
+        response = self._send(
+            "POST",
+            endpoint,
+            headers={
+                "Client-Id": self.credentials.client_id,
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        self._raise_for_status(response)
+        return self._decode(response)
+
+    def create_chat_message_subscription(
+        self,
+        *,
+        broadcaster_user_id: str,
+        user_id: str,
+        session_id: str,
+        access_token: str,
+    ) -> EventSubSubscription:
+        """Subscribe to a channel's chat over an EventSub WebSocket session.
+
+        Twitch only accepts this subscription with a **user** access token
+        carrying `user:read:chat`; an app token is rejected. `user_id` is the
+        connected account doing the reading, `broadcaster_user_id` the channel
+        being read. Both are Twitch's stable numeric ids, never logins.
+        """
+        payload = self.helix_post(
+            "eventsub/subscriptions",
+            access_token=access_token,
+            payload={
+                "type": CHAT_MESSAGE_SUBSCRIPTION_TYPE,
+                "version": CHAT_MESSAGE_SUBSCRIPTION_VERSION,
+                "condition": {
+                    "broadcaster_user_id": broadcaster_user_id,
+                    "user_id": user_id,
+                },
+                "transport": {"method": "websocket", "session_id": session_id},
+            },
+        )
+
+        entries = payload.get("data")
+        if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+            raise TwitchAPIError("Twitch returned an unexpected subscription payload.")
+
+        entry = entries[0]
+        subscription_id = str(entry.get("id") or "")
+        if not subscription_id:
+            raise TwitchAPIError("Twitch returned a subscription without an id.")
+
+        return EventSubSubscription(
+            subscription_id=subscription_id,
+            subscription_type=str(entry.get("type") or ""),
+            version=str(entry.get("version") or ""),
+            status=str(entry.get("status") or ""),
+        )
 
     def get_stream_by_user_id(self, user_id: str, *, access_token: str) -> TwitchStream | None:
         """Look up the broadcaster's current live stream.

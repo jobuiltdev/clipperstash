@@ -85,6 +85,8 @@ export type TwitchConnectionResponse = {
   account: TwitchAccount | null;
   scopes: string[];
   requires_reauthorization: boolean;
+  /** What the connection is currently authorized to do. Carries no tokens. */
+  capabilities: { chat_read: boolean };
 };
 
 export function getTwitchConnection(): Promise<TwitchConnectionResponse> {

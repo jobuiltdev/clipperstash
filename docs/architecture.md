@@ -69,10 +69,24 @@ This establishes *who* a channel is.
 This establishes *whether* a channel is broadcasting, one check at a time.
 Nothing drives those checks on a schedule.
 
+**Milestone 4 — chat ingestion. IMPLEMENTED.**
+
+- The connected-user OAuth scope set now includes `user:read:chat`, with a
+  capability check for connections granted before it existed.
+- An EventSub **WebSocket** runtime: welcome, keepalive, notification, reconnect
+  handoff and revocation.
+- A `channel.chat.message` subscription created over Helix with the user token.
+- Normalization into a narrow `ChatMessage`, with pseudonymized chatters and
+  database-enforced deduplication.
+- A foreground `monitor_chat` management command.
+
 Explicitly still out of scope:
 
-- Any recurring monitoring: no Celery Beat, no polling loop, no cron.
-- Twitch EventSub, including `stream.online` / `stream.offline`.
+- Any recurring monitoring or orchestration: no Celery Beat, no polling loop,
+  no cron, no supervisor. Chat runs only when a person starts it.
+- EventSub webhooks and Conduits; `stream.online` / `stream.offline`.
+- Twitch IRC.
+- Multi-stream scaling: socket pools, worker coordination, leader election.
 - Twitch EventSub subscriptions and chat ingestion.
 - Moment scoring or detection.
 - Clip creation, clip download or any media handling.
@@ -107,13 +121,12 @@ the health view and the Celery application. Product code lives under
 | ------------ | ----------------------------------------------------------- | ----------------------- |
 | `streamers`  | Streamer identity, resolution from a URL, stored channels    | IMPLEMENTED (see below) |
 | `twitch`     | Twitch API client, OAuth and credential handling             | IMPLEMENTED (see below) |
-| `monitoring` | Stream sessions and realtime signal ingestion                | PARTIAL (see below)     |
+| `monitoring` | Stream sessions and realtime signal ingestion                | IMPLEMENTED (see below) |
 | `moments`    | Moment scoring and interesting-moment detection              | NOT IMPLEMENTED         |
 | `clips`      | Clip records, clip creation and the dashboard's read models  | NOT IMPLEMENTED         |
 
-Twitch EventSub and chat ingestion will also live in `twitch`, and are NOT
-IMPLEMENTED. `monitoring` owns the stream-session half of its remit; realtime
-signal ingestion within it is NOT IMPLEMENTED. `moments` and `clips` still
+The EventSub transport lives in `twitch`, under `apps/twitch/eventsub/`;
+`monitoring` owns the chat domain that consumes it. `moments` and `clips` still
 contain only their `AppConfig` and an empty `models` module.
 
 ### Twitch integration
@@ -153,9 +166,18 @@ then exchanges the code for tokens over the backend's own connection to Twitch.
 The implicit flow is deliberately not supported: it would hand a token to the
 browser and leave the client secret unusable for refresh.
 
-**Requested scope.** `clips:edit` and nothing else. It is what clip creation will
-need in a later milestone. In particular `user:read:email` is not requested:
-ClipperStash has no use for the account's email address.
+**Requested scopes.** Exactly two: `clips:edit`, for clip creation in a later
+milestone, and `user:read:chat`, which Twitch requires on a **user** token to
+receive `channel.chat.message` over an EventSub WebSocket. Nothing else is
+requested — not `user:read:email`, and no bot, moderator or send-message scope,
+none of which is needed merely to *receive* chat as the authorizing user.
+
+**Capability, not deletion.** A connection authorized before `user:read:chat`
+existed is still valid for what it was granted, so it is kept. Instead,
+`TwitchConnection.missing_scopes()` reports the gap:
+`GET /api/twitch/connection/` returns `requires_reauthorization: true` and
+`capabilities.chat_read: false`, chat monitoring refuses to start, and
+re-authorizing updates the same row in place with the new scopes.
 
 **Connected identity.** After a successful exchange the backend calls
 `GET /helix/users` with the new user token. No query parameter is needed, as the
@@ -351,6 +373,125 @@ entry, periodic task or polling loop, and a test asserts the beat schedule is
 empty. Choosing a monitoring cadence is deferred until the chat-ingestion
 architecture is known.
 
+### Chat ingestion
+
+Twitch permits `channel.chat.message` over an EventSub WebSocket only with a
+**user** access token carrying `user:read:chat`. The app token used for streamer
+resolution and stream observation is not accepted here, so this is the one part
+of the pipeline that depends on a connected operator account.
+
+| Module                             | Responsibility                                   |
+| ---------------------------------- | ------------------------------------------------ |
+| `twitch/eventsub/messages.py`      | Envelope parsing; transport format only           |
+| `twitch/eventsub/client.py`        | The socket itself, and the seam tests replace     |
+| `twitch/eventsub/runtime.py`       | Welcome, keepalive, handoff, revocation, recovery |
+| `twitch/client.py` + `services.py` | Creating the subscription over Helix              |
+| `monitoring/chat.py`               | Normalization, pseudonymization, persistence      |
+| `monitoring/chat_monitor.py`       | Preconditions and wiring                          |
+| `monitoring/management/commands/monitor_chat.py` | The foreground entry point          |
+
+**Subscription.** `POST /helix/eventsub/subscriptions` with type
+`channel.chat.message`, version `1`, condition
+`{broadcaster_user_id, user_id}` and transport
+`{method: "websocket", session_id}`. `broadcaster_user_id` is the resolved
+streamer's stable Twitch id and `user_id` the connected account's; logins are
+never used as identity keys. A 401 triggers exactly one refresh and one retry,
+as established in Milestone 1; a second rejection flags the connection for
+re-authorization and stops.
+
+**Socket lifecycle.** One connection to `wss://eventsub.wss.twitch.tv/ws`. The
+subscription is created immediately on `session_welcome`, before any other frame
+is read, because Twitch expects it promptly. The read timeout comes from the
+`keepalive_timeout_seconds` Twitch sends, plus a small grace, rather than a
+hardcoded interval. Nothing is ever sent to the socket: EventSub is
+receive-oriented, and the library is configured with `ping_interval=None` so the
+only outbound traffic is a protocol-level pong answering Twitch's own pings.
+
+**Two kinds of reconnect**, deliberately distinguished:
+
+- *Twitch handoff.* A `session_reconnect` names a `reconnect_url`, used exactly
+  as supplied. Twitch carries the subscriptions to the replacement connection,
+  so none is recreated, and the old socket is held open until the replacement
+  has delivered its own welcome before being retired.
+- *Ordinary loss.* The socket dies or falls silent past the keepalive window.
+  There is no handoff, so a fresh connection to the base URL is opened and the
+  subscription is recreated against the new session id.
+
+Only those two URLs are ever dialled. No URL comes from user input.
+
+**Lost events are lost.** Twitch does not replay chat missed during a
+disconnected interval, and ClipperStash does not infer it. A gap in the stored
+messages is a real gap.
+
+**At-least-once delivery.** The same notification can arrive more than once.
+Both `twitch_event_message_id` (the EventSub delivery) and `twitch_message_id`
+(the chat message) are unique columns, so a repeat is refused by the database
+rather than by an in-memory set — which also holds across restarts.
+
+**What is kept.** Session, both ids, a chatter hash, the text, the timestamp and
+an emote count. Badges, colours, profile data, subscription and reward metadata,
+cheermotes, fragments and the raw payload are all discarded during
+normalization. Emotes are counted from Twitch's own fragments, never by scanning
+text for colon syntax. The text is retained solely because the moment detector
+needs reaction language as evidence.
+
+**Timestamp.** The EventSub `message_timestamp`, i.e. when Twitch produced the
+notification — the closest authoritative delivery time this subscription type
+offers, as `channel.chat.message` carries no separate sent-at field. Always
+timezone-aware UTC; the local clock is never substituted.
+
+**Pseudonymization.** The chatter's Twitch user id is HMAC-SHA256'd with
+`CHAT_USER_HASH_SECRET` and the raw id is never stored or logged. A keyed
+construction rather than a bare digest, because Twitch user ids are short
+numeric strings an unkeyed hash would not protect. The key is environment-only,
+never returned by an API, and deliberately separate from
+`TWITCH_CLIENT_SECRET`. It answers exactly one question — how many distinct
+chatters reacted.
+
+**Session ownership.** Messages attach only to a **live** `StreamSession`, and
+chat never creates one: stream observation remains the sole authority on stream
+lifecycle. A notification whose broadcaster does not match the session's streamer
+is rejected rather than filed. Shared Chat source metadata is ignored; the
+subscription's target channel is the ownership boundary, and Shared Chat
+analytics are deferred.
+
+**Chat failure is not stream state.** Revocation, an authentication failure or a
+dead socket stop ingestion, log a safe reason and — for revocation — mark the
+connection as needing re-authorization. None of them alters the `StreamSession`,
+and none deletes stored messages.
+
+**Retention.** `ChatMessage` is short-lived operational data for detection, not
+durable user history. Automatic expiry is **not** implemented:
+
+```
+automatic chat retention / deletion   NOT IMPLEMENTED
+```
+
+Nothing deletes these rows today; a later hardening milestone will add it.
+
+**A run follows one broadcast.** The monitor consults the session's current
+status before every receive and before replacing a socket, re-reading only the
+status with a single indexed `exists()` query rather than trusting the object
+loaded at startup. When stream observation ends the session, the run stops:
+socket closed, no reconnect, no new subscription, no change to the session, no
+chat deleted, and the connection is *not* flagged for re-authorization. It is a
+normal stop, reported separately from revocation, authentication failure, socket
+loss and keepalive timeout. Because the check rides the existing receive loop, a
+keepalive is enough to notice — a quiet channel does not keep a finished run
+alive — and no timer or extra polling loop is introduced. EventSub never decides
+that a stream ended; Milestone 3 remains the sole authority, and chat only
+observes what it decided.
+
+**Runtime.** A foreground management command, `monitor_chat`, run by a person.
+Nothing starts it automatically, no view spawns a socket thread, and there is no
+Celery task or Beat entry — a test asserts the beat schedule is empty. How
+continuous monitoring should be driven is deliberately deferred until the moment
+detector's shape is known:
+
+```
+autonomous monitor orchestration   NOT IMPLEMENTED
+```
+
 ### API surface
 
 | Method | Path                          | Notes                                              |
@@ -367,8 +508,9 @@ or broker reachability, versions, hostnames or environment values, because it is
 reachable without authentication.
 
 The connection endpoint returns a strict allowlist: `connected`, `account`
-(id, login, display name), `scopes` and `requires_reauthorization`. Access
-tokens, refresh tokens, the client secret, raw Twitch token responses and
+(id, login, display name), `scopes`, `requires_reauthorization` and
+`capabilities` (currently just `chat_read`). Access tokens, refresh tokens, the
+client secret, the chat hashing key, raw Twitch token responses and
 authorization codes are never part of any response.
 
 The callback returns the browser to the frontend with a short outcome flag such
@@ -378,8 +520,8 @@ reaches the browser, its URL, its storage or its JavaScript state.
 ### Data and messaging
 
 - **PostgreSQL** is the primary datastore. The product tables are
-  `twitch_twitchconnection`, `streamers_streamer` and
-  `monitoring_streamsession`.
+  `twitch_twitchconnection`, `streamers_streamer`, `monitoring_streamsession`
+  and `monitoring_chatmessage`.
 - **Redis** is the Celery broker and result backend, and also backs Django's
   cache, which holds the app access token and in-flight OAuth state.
 - **Celery** is configured in `backend/clipperstash/celery.py` and exposes a
@@ -420,8 +562,8 @@ framework and no animation library.
 Twitch API access / OAuth         IMPLEMENTED
   -> streamer resolution          IMPLEMENTED
   -> live / offline observation   IMPLEMENTED
+  -> chat ingestion               IMPLEMENTED (on demand)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> chat ingestion               NOT IMPLEMENTED
   -> moment scoring               NOT IMPLEMENTED
   -> Twitch clip                  NOT IMPLEMENTED
   -> ClipperStash dashboard       NOT IMPLEMENTED
@@ -434,8 +576,8 @@ Streamer URL                      IMPLEMENTED
   -> streamer resolution          IMPLEMENTED
   -> live / offline detection     IMPLEMENTED (on demand)
   -> stream session               IMPLEMENTED
+  -> realtime Twitch chat ingestion   IMPLEMENTED (on demand)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> realtime Twitch chat ingestion   NOT IMPLEMENTED
   -> moment scoring               NOT IMPLEMENTED
   -> interesting moment detection NOT IMPLEMENTED
   -> Twitch clip creation         NOT IMPLEMENTED
@@ -459,8 +601,8 @@ use. It is not part of the current milestone and no media tooling is installed.
 
 The pieces already in place map onto the pipeline as follows: the `twitch` app
 owns API access and credentials today and will own EventSub and chat ingestion,
-`streamers` owns channel identity today, `monitoring` owns live detection and
-session state today and will own realtime signal ingestion, `moments` will own
-scoring, and `clips` will own clip records and the dashboard's read side. Clip creation will use the `clips:edit` scope already
+`streamers` owns channel identity, `monitoring` owns live detection, session
+state and chat ingestion, `moments` will own scoring over the stored chat, and
+`clips` will own clip records and the dashboard's read side. Clip creation will use the `clips:edit` scope already
 being requested, and will act on a `Streamer` that has already been resolved. Long-running and scheduled work will run on the existing
 Celery worker against Redis, and all durable state will live in PostgreSQL.

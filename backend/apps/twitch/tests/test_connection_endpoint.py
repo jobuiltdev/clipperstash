@@ -27,6 +27,7 @@ def test_reports_disconnected_when_no_connection_exists(client):
         "account": None,
         "scopes": [],
         "requires_reauthorization": False,
+        "capabilities": {"chat_read": False},
     }
 
 
@@ -37,8 +38,9 @@ def test_reports_the_connected_account(client, connection):
     assert response.json() == {
         "connected": True,
         "account": {"id": "123456", "login": "example", "display_name": "Example"},
-        "scopes": ["clips:edit"],
+        "scopes": ["clips:edit", "user:read:chat"],
         "requires_reauthorization": False,
+        "capabilities": {"chat_read": True},
     }
 
 
@@ -90,3 +92,42 @@ def test_current_returns_the_most_recently_updated_connection(connection):
 
 def test_current_is_none_when_nothing_is_connected(db):
     assert TwitchConnection.objects.current() is None
+
+
+def test_a_connection_without_the_chat_scope_needs_reauthorization(client, connection):
+    """An older connection stays valid, but is reported as not chat-capable."""
+    connection.scopes = ["clips:edit"]
+    connection.save(update_fields=["scopes"])
+
+    payload = client.get(status_url()).json()
+
+    assert payload["connected"] is True
+    assert payload["scopes"] == ["clips:edit"]
+    assert payload["requires_reauthorization"] is True
+    assert payload["capabilities"]["chat_read"] is False
+
+
+def test_a_connection_with_both_scopes_is_chat_capable(client, connection):
+    payload = client.get(status_url()).json()
+
+    assert payload["requires_reauthorization"] is False
+    assert payload["capabilities"]["chat_read"] is True
+
+
+def test_a_rejected_connection_is_not_chat_capable(client, connection):
+    connection.mark_requires_reauthorization()
+
+    payload = client.get(status_url()).json()
+
+    assert payload["capabilities"]["chat_read"] is False
+    assert payload["requires_reauthorization"] is True
+
+
+def test_capability_reporting_never_exposes_tokens(client, connection):
+    connection.scopes = ["clips:edit"]
+    connection.save(update_fields=["scopes"])
+
+    body = client.get(status_url()).content.decode()
+
+    for secret in ALL_FAKE_SECRETS:
+        assert secret not in body

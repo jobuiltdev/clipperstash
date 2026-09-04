@@ -93,7 +93,7 @@ def token_payload(
     access_token: str = FAKE_ACCESS_TOKEN,
     refresh_token: str | None = FAKE_REFRESH_TOKEN,
     expires_in: int = 14400,
-    scope: Any = ("clips:edit",),
+    scope: Any = ("clips:edit", "user:read:chat"),
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "access_token": access_token,
@@ -182,7 +182,7 @@ def connection(db) -> TwitchConnection:
         access_token=FAKE_ACCESS_TOKEN,
         refresh_token=FAKE_REFRESH_TOKEN,
         token_expires_at=timezone.now() + timedelta(hours=4),
-        scopes=["clips:edit"],
+        scopes=["clips:edit", "user:read:chat"],
     )
 
 

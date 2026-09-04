@@ -25,6 +25,8 @@ from datetime import timedelta
 from django.db import models
 from django.utils import timezone
 
+from apps.twitch.oauth import CHAT_READ_SCOPE, REQUIRED_SCOPES
+
 # Window used by `is_token_expired`, which is informational only. Nothing on the
 # automatic request path consults it: Twitch's guidance is to react to a 401
 # rather than to refresh from a locally tracked expiry.
@@ -118,3 +120,27 @@ class TwitchConnection(models.Model):
     def mark_requires_reauthorization(self) -> None:
         self.requires_reauthorization = True
         self.save(update_fields=["requires_reauthorization", "updated_at"])
+
+    # -- capabilities --------------------------------------------------------
+    #
+    # A connection authorized before a scope was added is still a valid
+    # connection: its tokens work for what it was granted. It simply cannot do
+    # the newer thing until the operator re-authorizes, so capability is
+    # reported rather than the row being discarded.
+
+    def granted_scopes(self) -> set[str]:
+        return {str(scope) for scope in (self.scopes or [])}
+
+    def missing_scopes(self) -> tuple[str, ...]:
+        granted = self.granted_scopes()
+        return tuple(scope for scope in REQUIRED_SCOPES if scope not in granted)
+
+    @property
+    def can_read_chat(self) -> bool:
+        """Whether this connection may open an EventSub chat subscription."""
+        return CHAT_READ_SCOPE in self.granted_scopes() and not self.requires_reauthorization
+
+    @property
+    def needs_reauthorization(self) -> bool:
+        """True when Twitch rejected the connection, or a required scope is absent."""
+        return self.requires_reauthorization or bool(self.missing_scopes())

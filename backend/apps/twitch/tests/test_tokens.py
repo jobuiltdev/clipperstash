@@ -144,7 +144,8 @@ def test_refreshed_scopes_are_persisted(make_client, expired_connection):
     refresh_connection(expired_connection, client=make_client(transport))
 
     expired_connection.refresh_from_db()
-    assert expired_connection.scopes == ["clips:edit"]
+    assert expired_connection.scopes == ["clips:edit"], "Twitch's answer is authoritative"
+    assert expired_connection.can_read_chat is False
 
 
 def test_scopes_are_preserved_when_twitch_omits_them(make_client, expired_connection):
@@ -153,7 +154,7 @@ def test_scopes_are_preserved_when_twitch_omits_them(make_client, expired_connec
     refresh_connection(expired_connection, client=make_client(transport))
 
     expired_connection.refresh_from_db()
-    assert expired_connection.scopes == ["clips:edit"]
+    assert expired_connection.scopes == ["clips:edit", "user:read:chat"]
 
 
 def test_failed_refresh_raises_a_typed_authentication_error(make_client, expired_connection):

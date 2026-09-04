@@ -104,6 +104,27 @@ def failing_transport(
 
 
 @pytest.fixture
+def connection(db):
+    """A connected Twitch account carrying both required scopes."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.twitch.models import TwitchConnection
+    from apps.twitch.tests.conftest import FAKE_ACCESS_TOKEN, FAKE_REFRESH_TOKEN
+
+    return TwitchConnection.objects.create(
+        twitch_user_id="123456",
+        login="example",
+        display_name="Example",
+        access_token=FAKE_ACCESS_TOKEN,
+        refresh_token=FAKE_REFRESH_TOKEN,
+        token_expires_at=timezone.now() + timedelta(hours=4),
+        scopes=["clips:edit", "user:read:chat"],
+    )
+
+
+@pytest.fixture
 def streamer(db) -> Streamer:
     return Streamer.objects.create(
         platform=Platform.TWITCH,

@@ -8,11 +8,11 @@ Twitch clips and collects them in one dashboard. See
 current architecture and the planned pipeline.
 
 **Status:** foundation, the Twitch API and OAuth layer, streamer resolution,
-and on-demand live/offline observation. A Twitch channel can be resolved and
-checked for a live broadcast, which opens and closes a stream session. Chat
-ingestion, moment detection and clipping are not implemented yet, and there is
-no recurring monitoring — those stages are listed as `NOT IMPLEMENTED` in the
-architecture document.
+on-demand live/offline observation, and chat ingestion for a live session. A
+Twitch channel can be resolved, checked for a live broadcast, and its chat read
+over an EventSub WebSocket into stored messages. Moment detection and clipping
+are not implemented yet, and nothing monitors anything on a schedule — those
+stages are listed as `NOT IMPLEMENTED` in the architecture document.
 
 ## Repository layout
 
@@ -72,6 +72,35 @@ the project requires it, and the automated tests never contact Twitch.
 The client secret is backend-only. It is never sent to the browser, never
 returned by an API response, and must never be copied into a `NEXT_PUBLIC_*`
 variable. `.env` is gitignored; only the placeholder `.env.example` is tracked.
+
+Also set a chat hashing key in `.env`:
+
+```
+CHAT_USER_HASH_SECRET=replace-with-a-long-random-value
+```
+
+Chat ingestion stores an HMAC of each chatter's Twitch user id instead of the id
+itself, so activity can be counted without keeping viewer identities. Use a long
+random value, keep it distinct from `TWITCH_CLIENT_SECRET`, and be aware that
+rotating it makes previously stored hashes uncorrelatable with new ones.
+
+#### Scopes
+
+Connecting requests exactly two scopes:
+
+| Scope            | Needed for                                          |
+| ---------------- | --------------------------------------------------- |
+| `clips:edit`     | creating clips in a later milestone                  |
+| `user:read:chat` | reading chat over an EventSub WebSocket              |
+
+Nothing else is requested — no email, bot, moderator or send-message scope.
+
+**If you connected before chat support existed**, your stored connection only
+has `clips:edit`. It still works for what it was granted, and is not discarded,
+but `GET /api/twitch/connection/` reports `requires_reauthorization: true` and
+`capabilities.chat_read: false`, and chat monitoring refuses to start. Press
+**Connect Twitch** again to re-authorize with both scopes; the existing
+connection is updated in place.
 
 #### Token handling
 
@@ -254,6 +283,43 @@ Each request is one check. There is no background polling and no scheduler; how
 continuous monitoring should be driven is deferred until chat ingestion is
 designed.
 
+## Chat monitoring
+
+Chat ingestion is a foreground command, run explicitly. Nothing starts it
+automatically — not `runserver`, not Celery, not a timer — and no Twitch
+connection of any kind is opened unless you run it.
+
+```bash
+cd backend
+python manage.py monitor_chat <streamer-id>
+# or target a specific session
+python manage.py monitor_chat --session <session-id>
+```
+
+It refuses to start unless all of the following hold, so an unusable run never
+opens a socket:
+
+1. a Twitch account is connected,
+2. that connection carries `user:read:chat`,
+3. `CHAT_USER_HASH_SECRET` is set,
+4. the target streamer has a **live** `StreamSession`.
+
+The last point matters: chat never creates a session. Run
+`POST /api/streamers/<id>/observe/` (or the frontend's **Check live status**)
+first — if that says offline, `monitor_chat` will refuse with `stream_not_live`
+rather than inventing a broadcast.
+
+It runs while the selected `StreamSession` remains live, and exits cleanly once
+stream observation has ended that session — closing its socket, not reconnecting
+and not recreating a subscription. EventSub itself does not decide when a stream
+ends; the monitor only observes the session status that
+`POST /api/streamers/<id>/observe/` maintains. Press Ctrl+C to stop sooner.
+`--max-connections N` bounds a run to N EventSub connections, which is useful
+for a short manual check.
+
+Messages missed while the connection was down are gone: Twitch does not replay
+chat, and ClipperStash does not guess at what it did not see.
+
 ## Checks
 
 Backend (from `backend/`, with the virtualenv active):
@@ -292,6 +358,7 @@ for the full list.
 | `TWITCH_CLIENT_ID`       | Twitch application client ID                   |
 | `TWITCH_CLIENT_SECRET`   | Twitch application client secret (backend-only)|
 | `TWITCH_REDIRECT_URI`    | Registered Twitch OAuth redirect URL           |
+| `CHAT_USER_HASH_SECRET`  | Key for pseudonymizing chatter ids (backend-only) |
 | `NEXT_PUBLIC_API_BASE_URL` | Backend base URL used by the frontend        |
 
 Never commit real credentials, API keys or tokens.

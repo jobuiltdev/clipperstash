@@ -15,10 +15,19 @@ from django.core.cache import cache
 from apps.twitch.client import OAUTH_AUTHORIZE_URL, TwitchCredentials
 from apps.twitch.exceptions import TwitchOAuthStateError
 
-# The only scope V0 needs. Clip creation in a later milestone requires
-# `clips:edit`; nothing else is requested, and in particular the account's email
-# address is never requested.
-REQUIRED_SCOPES: tuple[str, ...] = ("clips:edit",)
+# The scopes V0 needs, and nothing more.
+#
+#   clips:edit      clip creation in a later milestone
+#   user:read:chat  reading chat over an EventSub WebSocket, which Twitch only
+#                   permits with a user access token carrying this scope
+#
+# The account's email address is never requested, and no bot, moderator or
+# send-message scope is requested: none is required to *receive*
+# channel.chat.message over a WebSocket authorized by the reading user.
+REQUIRED_SCOPES: tuple[str, ...] = ("clips:edit", "user:read:chat")
+
+# The scope that gates chat monitoring specifically.
+CHAT_READ_SCOPE = "user:read:chat"
 
 STATE_CACHE_PREFIX = "twitch:oauth:state:"
 STATE_TTL_SECONDS = 600

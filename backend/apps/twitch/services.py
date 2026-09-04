@@ -14,6 +14,7 @@ from django.core.cache import cache
 from django.db import transaction
 
 from apps.twitch.client import (
+    EventSubSubscription,
     TokenResponse,
     TokenValidation,
     TwitchClient,
@@ -240,6 +241,84 @@ def helix_get_as_connection(
         raise
 
 
+def helix_post_as_connection(
+    connection: TwitchConnection,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    client: TwitchClient | None = None,
+) -> dict[str, Any]:
+    """Authenticated Helix POST on behalf of the connection.
+
+    Mirrors `helix_get_as_connection`: the stored token is used as-is, and a 401
+    triggers exactly one refresh and one replay. A second rejection marks the
+    connection for re-authorization and propagates.
+    """
+    client = client or TwitchClient()
+    try:
+        return client.helix_post(path, access_token=connection.get_access_token(), payload=payload)
+    except TwitchAuthenticationError:
+        logger.info("Twitch rejected the access token; refreshing once and retrying.")
+
+    connection = refresh_connection(connection, client=client)
+
+    try:
+        return client.helix_post(path, access_token=connection.get_access_token(), payload=payload)
+    except TwitchAuthenticationError:
+        logger.warning(
+            "Twitch rejected the refreshed access token for user_id=%s; re-authorization required.",
+            connection.twitch_user_id,
+        )
+        connection.mark_requires_reauthorization()
+        raise
+
+
+def create_chat_message_subscription(
+    connection: TwitchConnection,
+    *,
+    broadcaster_user_id: str,
+    session_id: str,
+    client: TwitchClient | None = None,
+) -> EventSubSubscription:
+    """Create the chat subscription for an EventSub WebSocket session.
+
+    Uses the connected account's **user** token, never the app token, because
+    Twitch requires one for `channel.chat.message` over a WebSocket. The caller
+    is responsible for having checked `connection.can_read_chat` first.
+    """
+    client = client or TwitchClient()
+
+    def create(access_token: str) -> EventSubSubscription:
+        return client.create_chat_message_subscription(
+            broadcaster_user_id=broadcaster_user_id,
+            user_id=connection.twitch_user_id,
+            session_id=session_id,
+            access_token=access_token,
+        )
+
+    try:
+        subscription = create(connection.get_access_token())
+    except TwitchAuthenticationError:
+        logger.info("Twitch rejected the access token; refreshing once and retrying.")
+        connection = refresh_connection(connection, client=client)
+        try:
+            subscription = create(connection.get_access_token())
+        except TwitchAuthenticationError:
+            logger.warning(
+                "Twitch rejected the refreshed token for user_id=%s; re-authorization required.",
+                connection.twitch_user_id,
+            )
+            connection.mark_requires_reauthorization()
+            raise
+
+    logger.info(
+        "Created chat subscription for broadcaster_user_id=%s (status=%s).",
+        broadcaster_user_id,
+        subscription.status,
+    )
+    return subscription
+
+
 def build_connection_status(connection: TwitchConnection | None) -> dict[str, Any]:
     """Safe, public-facing view of the connection. Carries no token material."""
     if connection is None:
@@ -248,6 +327,7 @@ def build_connection_status(connection: TwitchConnection | None) -> dict[str, An
             "account": None,
             "scopes": [],
             "requires_reauthorization": False,
+            "capabilities": {"chat_read": False},
         }
     return {
         "connected": True,
@@ -257,5 +337,8 @@ def build_connection_status(connection: TwitchConnection | None) -> dict[str, An
             "display_name": connection.display_name,
         },
         "scopes": list(connection.scopes),
-        "requires_reauthorization": connection.requires_reauthorization,
+        # True when Twitch rejected the connection *or* when it predates a scope
+        # ClipperStash now needs, so the frontend has one flag to act on.
+        "requires_reauthorization": connection.needs_reauthorization,
+        "capabilities": {"chat_read": connection.can_read_chat},
     }

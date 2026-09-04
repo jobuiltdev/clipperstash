@@ -131,8 +131,14 @@ export function TwitchConnection() {
 
       {state.kind === "loaded" && state.connection.requires_reauthorization && (
         <p className="text-sm text-muted">
-          Twitch revoked this authorization. Connect again to restore access.
+          {state.connection.connected && !state.connection.capabilities.chat_read
+            ? "This connection cannot read chat. Connect again to grant chat access."
+            : "Twitch revoked this authorization. Connect again to restore access."}
         </p>
+      )}
+
+      {state.kind === "loaded" && state.connection.capabilities.chat_read && (
+        <p className="text-sm text-muted">Chat monitoring is authorized.</p>
       )}
 
       {message && <p className="text-sm text-muted">{message}</p>}

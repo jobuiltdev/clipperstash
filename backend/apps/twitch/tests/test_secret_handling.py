@@ -84,7 +84,14 @@ def test_refresh_failure_logs_no_secret(make_client, expired_connection, caplog)
 def test_connection_status_payload_is_a_strict_allowlist(connection):
     payload = services.build_connection_status(connection)
 
-    assert set(payload) == {"connected", "account", "scopes", "requires_reauthorization"}
+    assert set(payload) == {
+        "connected",
+        "account",
+        "scopes",
+        "requires_reauthorization",
+        "capabilities",
+    }
+    assert set(payload["capabilities"]) == {"chat_read"}
     assert set(payload["account"]) == {"id", "login", "display_name"}
 
 

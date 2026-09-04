@@ -153,3 +153,11 @@ TWITCH_REDIRECT_URI = env(
     "TWITCH_REDIRECT_URI",
     default="http://localhost:8000/api/twitch/oauth/callback/",
 )
+
+# Keyed hashing secret for chatter pseudonymization. Chat ingestion stores an
+# HMAC of a chatter's Twitch user id rather than the id itself, so activity can
+# be counted without keeping viewer identities. It is deliberately separate from
+# TWITCH_CLIENT_SECRET: the two protect different things and rotate
+# independently. Changing it makes previously stored hashes uncorrelatable.
+# It is backend-only and is never returned by an API or written to a log.
+CHAT_USER_HASH_SECRET = env("CHAT_USER_HASH_SECRET", default="")

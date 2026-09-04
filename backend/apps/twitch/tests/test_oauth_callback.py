@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from django.urls import reverse
+from django.utils import timezone
 
 from apps.twitch import oauth
 from apps.twitch.client import OAUTH_TOKEN_URL
@@ -57,7 +59,7 @@ def test_successful_callback_persists_the_connection(client, patch_service_clien
     assert connection.twitch_user_id == "123456"
     assert connection.login == "example"
     assert connection.display_name == "Example"
-    assert connection.scopes == ["clips:edit"]
+    assert connection.scopes == ["clips:edit", "user:read:chat"]
     assert connection.requires_reauthorization is False
 
 
@@ -253,3 +255,26 @@ def test_reconnecting_the_same_account_updates_in_place(client, patch_service_cl
     connection = TwitchConnection.objects.current()
     assert connection.login == "renamed"
     assert connection.get_access_token() == "NEW-TOKEN"
+
+
+def test_reconnecting_updates_persisted_scopes(client, patch_service_client):
+    """An older single-scope connection is upgraded by re-authorizing."""
+    connection = TwitchConnection.objects.create(
+        twitch_user_id="123456",
+        login="example",
+        display_name="Example",
+        access_token="old-access",
+        refresh_token="old-refresh",
+        token_expires_at=timezone.now() + timedelta(hours=1),
+        scopes=["clips:edit"],
+    )
+    assert connection.can_read_chat is False
+
+    patch_service_client(successful_transport())
+    client.get(callback_url(), {"code": FAKE_AUTH_CODE, "state": oauth.create_state()})
+
+    connection.refresh_from_db()
+    assert TwitchConnection.objects.count() == 1
+    assert connection.scopes == ["clips:edit", "user:read:chat"]
+    assert connection.can_read_chat is True
+    assert connection.requires_reauthorization is False

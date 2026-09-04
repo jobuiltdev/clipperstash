@@ -19,6 +19,22 @@ FAKE_FRONTEND_URL = "http://localhost:3000"
 
 
 @pytest.fixture(autouse=True)
+def no_real_websocket(monkeypatch):
+    """Make a live WebSocket connection impossible for the whole suite.
+
+    Every EventSub test drives a scripted in-process socket. If any code path
+    ever reaches the real client, this fails loudly instead of dialling Twitch.
+    """
+    import websockets.sync.client
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("Tests must never open a real WebSocket connection.")
+
+    monkeypatch.setattr(websockets.sync.client, "connect", refuse)
+    monkeypatch.setattr("apps.twitch.eventsub.client.websocket_connect", refuse)
+
+
+@pytest.fixture(autouse=True)
 def twitch_test_settings(settings):
     """Configure a fake Twitch application and an in-memory cache."""
     settings.TWITCH_CLIENT_ID = FAKE_CLIENT_ID

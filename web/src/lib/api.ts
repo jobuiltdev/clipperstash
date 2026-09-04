@@ -41,3 +41,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export function getHealth(): Promise<HealthResponse> {
   return request<HealthResponse>("/api/health/");
 }
+
+export type TwitchAccount = {
+  id: string;
+  login: string;
+  display_name: string;
+};
+
+/**
+ * The safe view of the Twitch connection. The backend deliberately never sends
+ * token material, so there is nothing token-shaped to model here.
+ */
+export type TwitchConnectionResponse = {
+  connected: boolean;
+  account: TwitchAccount | null;
+  scopes: string[];
+  requires_reauthorization: boolean;
+};
+
+export function getTwitchConnection(): Promise<TwitchConnectionResponse> {
+  return request<TwitchConnectionResponse>("/api/twitch/connection/");
+}
+
+/**
+ * Entry point for the OAuth flow. The browser navigates here; the backend then
+ * redirects on to Twitch, so no credential ever reaches the frontend.
+ */
+export const TWITCH_OAUTH_START_URL = `${API_BASE_URL}/api/twitch/oauth/start/`;

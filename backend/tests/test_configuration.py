@@ -38,3 +38,14 @@ def test_celery_uses_the_configured_broker() -> None:
 
 def test_health_route_is_registered() -> None:
     assert reverse("health") == "/api/health/"
+
+
+def test_no_recurring_schedule_is_registered() -> None:
+    """V0 runs no periodic work.
+
+    In particular, Twitch's requirement to validate an OAuth access token at
+    startup and hourly thereafter is documented as a deferred runtime
+    obligation, not automated here. This test fails if a schedule is added
+    without revisiting that documentation.
+    """
+    assert not celery_app.conf.beat_schedule

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { TwitchConnection } from "@/components/twitch-connection";
 import { API_BASE_URL, getHealth } from "@/lib/api";
 
 type BackendState =
@@ -95,6 +96,8 @@ export default function Home() {
           is a placeholder for the planned workflow.
         </p>
       </section>
+
+      <TwitchConnection />
 
       <section aria-labelledby="status-heading" className="space-y-3">
         <h2 id="status-heading" className="text-sm font-medium">

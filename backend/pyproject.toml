@@ -12,5 +12,5 @@ quote-style = "double"
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "clipperstash.settings"
 python_files = ["test_*.py"]
-testpaths = ["tests"]
+testpaths = ["tests", "apps"]
 addopts = "-q"

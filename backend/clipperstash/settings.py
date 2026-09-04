@@ -130,3 +130,26 @@ CELERY_TASK_TRACK_STARTED = True
 
 # The Next.js development server is the only browser client during V0.
 CORS_ALLOWED_ORIGINS = env("CORS_ALLOWED_ORIGINS")
+
+# Django's cache is backed by Redis. It holds short-lived integration state such
+# as the Twitch app access token and in-flight OAuth state values.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": env("CACHE_URL", default=REDIS_URL),
+        "KEY_PREFIX": "clipperstash",
+    }
+}
+
+# Where the backend sends the browser once an OAuth round trip finishes.
+FRONTEND_BASE_URL = env("FRONTEND_BASE_URL", default="http://localhost:3000")
+
+# --- Twitch integration -----------------------------------------------------
+# The client secret is backend-only. It must never be exposed through an API
+# response, a template, a log line or a NEXT_PUBLIC_* frontend variable.
+TWITCH_CLIENT_ID = env("TWITCH_CLIENT_ID", default="")
+TWITCH_CLIENT_SECRET = env("TWITCH_CLIENT_SECRET", default="")
+TWITCH_REDIRECT_URI = env(
+    "TWITCH_REDIRECT_URI",
+    default="http://localhost:8000/api/twitch/oauth/callback/",
+)

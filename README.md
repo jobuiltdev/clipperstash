@@ -18,7 +18,7 @@ stages are listed as `NOT IMPLEMENTED` in the architecture document.
 
 ```
 backend/             Django project, product apps and the Twitch integration
-web/                 Next.js application shell
+web/                 Next.js frontend and the operator dashboard
 docs/                Project documentation
 docker-compose.yml   PostgreSQL and Redis for local development
 .env.example         Placeholder configuration
@@ -206,9 +206,19 @@ The live check runs only when the button is pressed. A failed check is shown as
 | `GET`  | `/api/twitch/oauth/start/`      | Begins the Twitch Authorization Code flow   |
 | `GET`  | `/api/twitch/oauth/callback/`   | Twitch redirect target; exchanges the code  |
 | `GET`  | `/api/twitch/connection/`       | Safe status of the connected Twitch account |
+| `GET`  | `/api/dashboard/overview/`      | Installation-wide counts and a short recent feed |
+| `GET`  | `/api/dashboard/detector-config/` | The detector calibration in force         |
+| `GET`  | `/api/streamers/<id>/sessions/` | Sessions observed for one streamer           |
+| `GET`  | `/api/sessions/<id>/`           | One session, with its moment breakdown       |
+| `GET`  | `/api/sessions/<id>/moments/`   | Moments detected in that session             |
+| `GET`  | `/api/moments/<id>/`            | One moment, with the full working behind it  |
 
 None of these responses contain tokens, the client secret or an authorization
 code.
+
+The six dashboard endpoints accept `GET` alone. They never write, never contact
+Twitch, never run the detector and never request a clip, so reading the
+dashboard cannot change what it is describing.
 
 ### Resolving a streamer
 
@@ -470,6 +480,55 @@ reconciliation policy — deferred to a later milestone — has everything it ne
 Nothing connects the stages: chat ingestion does not run the detector, and the
 detector does not request clips. Clips are not downloaded, edited, captioned or
 posted anywhere.
+
+## Dashboard
+
+`/dashboard` in the frontend is a read-only view of everything the pipeline has
+recorded: installation counts, live and past sessions, the moments detected in
+each, and what became of every clip request.
+
+| Route                             | Shows                                          |
+| --------------------------------- | ---------------------------------------------- |
+| `/dashboard`                      | Counts, live sessions, recent moments, verified clips |
+| `/dashboard/streamers/<id>`       | Every session observed for one streamer         |
+| `/dashboard/sessions/<id>`        | One session and its moments, filterable         |
+| `/dashboard/moments/<id>`         | One moment: score breakdown, windows, clip      |
+
+Three properties are deliberate:
+
+- **It only reads.** There is no control anywhere on it that requests a clip,
+  starts an observation or changes any lifecycle state.
+- **It refreshes when asked.** Every panel has a refresh button and no timer,
+  interval, WebSocket or Server-Sent Events stream. A tab left open overnight
+  makes no requests.
+- **It publishes no chat.** Chat is reported as a message count. The transcript
+  is pipeline input, and no endpoint serves it.
+
+The "recent verified clips" feed lists only clips Twitch is confirmed to have
+created — the candidate reached `CLIP_CREATED`, a Twitch clip id was recorded
+and verification stamped `ready_at` — ordered by that confirmation time, newest
+first. A local `Clip` row is written before the external request, so its
+existence proves only that ClipperStash asked. Requests that were merely
+accepted, requests whose outcome was never learned and failed requests are
+therefore absent from that feed; they remain visible in the recent moments
+feed, the summary counts and the per-session moment list.
+
+### Clip states on the dashboard
+
+Moments are grouped by what became of their clip. The five states partition
+every candidate exactly once, so the counts always sum to the total:
+
+| State             | Meaning                                                     |
+| ----------------- | ----------------------------------------------------------- |
+| No clip           | Detected or rejected; nothing was ever asked of Twitch       |
+| Clip requested    | Twitch acknowledged the request; not yet confirmed           |
+| Outcome unknown   | Claimed, and the result never learned — see above            |
+| Clip ready        | Twitch confirmed the clip exists                             |
+| Clip failed       | Twitch answered, and the clip was not created                |
+
+"Outcome unknown" is shown separately from "Clip failed" on purpose. A failure
+means Twitch said no; an unknown outcome means nobody knows, and the clip may
+well exist.
 
 ## Checks
 

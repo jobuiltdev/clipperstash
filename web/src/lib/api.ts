@@ -163,3 +163,213 @@ export function observeStreamer(streamerId: number): Promise<ObservationResponse
     headers: { "Content-Type": "application/json" },
   });
 }
+
+
+/* ---------------------------------------------------------------------------
+ * Dashboard reads
+ *
+ * Everything below is read-only. There is no dashboard mutation in this
+ * milestone, so none of these helpers takes a method other than the implicit
+ * GET, and none of them sends a body.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * How far a moment got towards becoming a clip.
+ *
+ * `request_unknown` is not a failure. It means a clip request was claimed and
+ * nobody ever learned what Twitch did with it — Twitch's Create Clip takes no
+ * idempotency key, so ClipperStash refuses to guess by sending another.
+ */
+export type ClipState =
+  | "not_requested"
+  | "requested"
+  | "request_unknown"
+  | "created"
+  | "failed";
+
+export type StreamerRef = {
+  id: number;
+  username: string;
+  display_name: string;
+  channel_url: string;
+  profile_image_url: string;
+};
+
+/** A clip exactly as stored. Twitch's `edit_url` is never persisted or sent. */
+export type Clip = {
+  id: number;
+  twitch_clip_id: string | null;
+  twitch_url: string;
+  title: string;
+  duration: number | null;
+  thumbnail_url: string;
+  twitch_created_at: string | null;
+  requested_at: string;
+  ready_at: string | null;
+  failure_code: string;
+  failure_detail: string;
+};
+
+/** One moment row, with the full working behind its score. */
+export type MomentSummary = {
+  id: number;
+  detected_at: string;
+  status: string;
+  total_score: number;
+  velocity_score: number;
+  reaction_score: number;
+  emote_score: number;
+  diversity_score: number;
+  absolute_activity_score: number;
+  velocity_ratio: number;
+  current_message_count: number;
+  baseline_message_count: number;
+  current_unique_chatter_count: number;
+  baseline_unique_chatter_count: number;
+  current_emote_count: number;
+  baseline_emote_count: number;
+  current_reaction_count: number;
+  baseline_reaction_count: number;
+  clip_state: ClipState;
+  clip_id: number | null;
+  twitch_clip_id: string | null;
+  twitch_url: string;
+  failure_code: string;
+  requested_at: string | null;
+  ready_at: string | null;
+};
+
+/** A moment shown away from its own session, so it names its context. */
+export type MomentFeedItem = MomentSummary & {
+  session_id: number;
+  session_title: string;
+  streamer: StreamerRef;
+};
+
+export type MomentWindows = {
+  baseline_start: string;
+  baseline_end: string;
+  current_start: string;
+  current_end: string;
+};
+
+export type MomentDetail = MomentFeedItem & {
+  windows: MomentWindows;
+  /** The detector's threshold at read time, so a score can be read against it. */
+  threshold: number;
+  failure_detail: string;
+  clip: Clip | null;
+};
+
+export type SessionSummary = {
+  id: number;
+  streamer: StreamerRef;
+  platform_stream_id: string;
+  status: "live" | "ended";
+  started_at: string;
+  ended_at: string | null;
+  title: string;
+  category: string;
+  language: string;
+  viewer_count: number;
+  last_observed_at: string;
+  moment_count: number;
+  clip_created_count: number;
+};
+
+/** Moments partitioned by clip state. The parts always sum to `total`. */
+export type MomentCounts = {
+  total: number;
+  not_requested: number;
+  requested: number;
+  request_unknown: number;
+  created: number;
+  failed: number;
+};
+
+export type SessionDetail = SessionSummary & {
+  is_mature: boolean;
+  counts: MomentCounts & { chat_messages: number };
+};
+
+/** One bounded window over a list, with the total it was drawn from. */
+export type Page<T> = {
+  count: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  results: T[];
+};
+
+export type DashboardOverview = {
+  generated_at: string;
+  counts: {
+    streamers: { total: number; active: number };
+    sessions: { total: number; live: number; ended: number };
+    moments: MomentCounts;
+  };
+  live_sessions: SessionSummary[];
+  recent_sessions: SessionSummary[];
+  recent_moments: MomentFeedItem[];
+  recent_clips: MomentFeedItem[];
+};
+
+/** The detector calibration in force, served from the detector's own config. */
+export type DetectorConfig = {
+  candidate_threshold: number;
+  auto_clip_threshold: number;
+  current_window_seconds: number;
+  baseline_window_seconds: number;
+  cooldown_seconds: number;
+  minimum_current_messages: number;
+  minimum_current_chatters: number;
+  weights: Record<string, number>;
+  clip_freshness_seconds: number;
+  clip_verification_timeout_seconds: number;
+};
+
+export function getDashboardOverview(): Promise<DashboardOverview> {
+  return request<DashboardOverview>("/api/dashboard/overview/");
+}
+
+/*
+ * The backend wraps each read in a named key — `{ session: ... }`, `{ moments:
+ * ... }` — so a response is self-describing and can grow a sibling field
+ * without breaking anything. The envelope is modelled here and unwrapped at
+ * this boundary, so callers work with the resource itself.
+ */
+
+export async function getDetectorConfig(): Promise<DetectorConfig> {
+  const { detector } = await request<{ detector: DetectorConfig }>(
+    "/api/dashboard/detector-config/",
+  );
+  return detector;
+}
+
+export async function getStreamerSessions(streamerId: number): Promise<Page<SessionSummary>> {
+  const { sessions } = await request<{ sessions: Page<SessionSummary> }>(
+    `/api/streamers/${streamerId}/sessions/`,
+  );
+  return sessions;
+}
+
+export async function getSession(sessionId: number): Promise<SessionDetail> {
+  const { session } = await request<{ session: SessionDetail }>(`/api/sessions/${sessionId}/`);
+  return session;
+}
+
+export async function getSessionMoments(
+  sessionId: number,
+  options: { clipState?: ClipState } = {},
+): Promise<Page<MomentSummary>> {
+  const query = options.clipState ? `?clip_state=${options.clipState}` : "";
+  const { moments } = await request<{ moments: Page<MomentSummary> }>(
+    `/api/sessions/${sessionId}/moments/${query}`,
+  );
+  return moments;
+}
+
+export async function getMoment(momentId: number): Promise<MomentDetail> {
+  const { moment } = await request<{ moment: MomentDetail }>(`/api/moments/${momentId}/`);
+  return moment;
+}

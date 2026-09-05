@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useState, type FormEvent } from "react";
 
 import { LiveStatus } from "@/components/live-status";
@@ -122,14 +123,22 @@ export function StreamerResolver() {
                 <BroadcasterBadge type={state.streamer.broadcaster_type} />
               </div>
               <p className="text-sm text-muted">@{state.streamer.username}</p>
-              <a
-                href={state.streamer.channel_url}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="inline-block text-sm underline underline-offset-2"
-              >
-                View on Twitch
-              </a>
+              <div className="flex flex-wrap gap-3">
+                <a
+                  href={state.streamer.channel_url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="text-sm underline underline-offset-2"
+                >
+                  View on Twitch
+                </a>
+                <Link
+                  href={`/dashboard/streamers/${state.streamer.id}`}
+                  className="text-sm underline underline-offset-2"
+                >
+                  Session history
+                </Link>
+              </div>
             </div>
           </div>
 

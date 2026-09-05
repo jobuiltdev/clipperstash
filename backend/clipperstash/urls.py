@@ -8,4 +8,7 @@ urlpatterns = [
     path("api/health/", health, name="health"),
     path("api/streamers/", include("apps.streamers.urls")),
     path("api/twitch/", include("apps.twitch.urls")),
+    # Read-only dashboard routes. Listed last so the app-specific prefixes
+    # above always win; nothing here shadows them.
+    path("api/", include("apps.dashboard.urls")),
 ]

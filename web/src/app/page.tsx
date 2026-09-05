@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import { StreamerResolver } from "@/components/streamer-resolver";
@@ -67,6 +68,9 @@ export default function Home() {
         <p className="text-lg text-muted">
           Turn live moments into clips automatically.
         </p>
+        <Link href="/dashboard" className="inline-block text-sm underline underline-offset-2">
+          Open the dashboard
+        </Link>
       </header>
 
       <StreamerResolver />

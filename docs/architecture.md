@@ -101,22 +101,51 @@ The detector decides *that* a moment happened.
 
 That completes the V0 pipeline as a sequence of manual steps.
 
+**Milestone 7 — read-only operator dashboard. IMPLEMENTED.**
+
+- Six `GET` endpoints over what the pipeline has already recorded: an overview,
+  the detector calibration, a streamer's sessions, one session, that session's
+  moments and one moment.
+- A derived clip display state that separates an unknown request outcome from a
+  failure, without adding a column or writing anything back.
+- A `/dashboard` area in the frontend with overview, streamer, session and
+  moment views, each with explicit loading, empty and failure states.
+
+The dashboard only observes. It performs no write, contacts no external service
+and refreshes only when a person asks it to.
+
+Every stage of the V0 pipeline described in these milestones exists and can be
+run. **None of it runs by itself.** Chat ingestion, detection and clip creation are each started
+explicitly by a person, and no stage invokes the next. That an operator can
+execute a live Create Clip today is not automatic clipping, and this document
+should not be read as claiming otherwise.
+
 Explicitly still out of scope:
 
 - Any recurring monitoring, scheduling or orchestration: no Celery Beat, no
-  polling loop, no cron, no supervisor. Chat ingestion and detection each run
-  only when a person starts them, and neither invokes the other.
-- Twitch clip creation, retrieval or download.
+  polling loop, no cron, no supervisor. Chat ingestion, detection and clip
+  creation each run only when a person starts them, and none invokes the next.
+- Automatic monitor -> detect -> clip orchestration, and any automatic or
+  continuous detector scheduling.
+- Detector calibration against real collected streams, which is Milestone 8's
+  work. Today's weights, thresholds and saturation points are initial values.
+- Create Clip From VOD and any historical clipping. Live Create Clip captures
+  what is airing when the request arrives, so a moment that has passed cannot
+  be clipped.
+- Clip downloading, Get Clips Download, CDN scraping and any other media
+  retrieval. Nothing is fetched from Twitch beyond API metadata.
+- FFmpeg, transcription (Whisper or otherwise), captions and vertical
+  rendering.
+- Publishing anywhere: TikTok, Instagram, YouTube or any other destination.
 - EventSub webhooks and Conduits; `stream.online` / `stream.offline`.
 - Twitch IRC.
 - Multi-stream scaling: socket pools, worker coordination, leader election.
+- Automatic chat retention or deletion.
 - Any model inference: no LLM, no sentiment API, no embeddings, and no audio or
   video analysis. Every signal is a count over text the pipeline already has.
-- Twitch EventSub subscriptions and chat ingestion.
-- Moment scoring or detection.
-- Clip creation, clip download or any media handling.
-- FFmpeg, transcription, captions and vertical rendering.
-- ClipperStash end-user authentication, accounts, billing and social publishing.
+- ClipperStash end-user authentication, accounts, sessions, permissions,
+  billing, teams, quotas, multi-tenant authorization and social publishing. The
+  dashboard is unauthenticated, single-tenant and read-only.
 - Scheduled/background work of any kind, including the startup-and-hourly Twitch
   token validation cadence described below.
 - Production deployment infrastructure.
@@ -140,7 +169,7 @@ docker-compose.yml   PostgreSQL and Redis for local development
 
 The Django project is `backend/clipperstash/`. It holds settings, URL routing,
 the health view and the Celery application. Product code lives under
-`backend/apps/`, split into the five domains the pipeline will need:
+`backend/apps/`, split into the domains the pipeline needs:
 
 | App          | Responsibility                                              | Status                  |
 | ------------ | ----------------------------------------------------------- | ----------------------- |
@@ -148,12 +177,14 @@ the health view and the Celery application. Product code lives under
 | `twitch`     | Twitch API client, OAuth and credential handling             | IMPLEMENTED (see below) |
 | `monitoring` | Stream sessions and realtime signal ingestion                | IMPLEMENTED (see below) |
 | `moments`    | Moment scoring and interesting-moment detection              | IMPLEMENTED (see below) |
-| `clips`      | Clip records, clip creation and the dashboard's read models  | IMPLEMENTED (see below) |
+| `clips`      | Clip records and clip creation                               | IMPLEMENTED (see below) |
+| `dashboard`  | Read-only presentation across every other app; no models     | IMPLEMENTED (see below) |
 
 The EventSub transport lives in `twitch`, under `apps/twitch/eventsub/`;
 `monitoring` owns the chat domain that consumes it, `moments` owns detection over
-that chat, and `clips` owns turning a detected moment into a Twitch clip. The
-dashboard read models `clips` will eventually also own are NOT IMPLEMENTED.
+that chat, and `clips` owns turning a detected moment into a Twitch clip.
+`dashboard` owns the read side and nothing else: it stores nothing, writes
+nothing, and every domain app remains usable without it.
 
 ### Twitch integration
 
@@ -752,6 +783,12 @@ VOD historical clipping                    NOT IMPLEMENTED
 | `GET`  | `/api/twitch/oauth/start/`    | Redirects to Twitch; carries no secret              |
 | `GET`  | `/api/twitch/oauth/callback/` | Exchanges the code, then redirects to the frontend  |
 | `GET`  | `/api/twitch/connection/`     | Connection status; carries no token material        |
+| `GET`  | `/api/dashboard/overview/`    | Installation counts and a bounded recent feed       |
+| `GET`  | `/api/dashboard/detector-config/` | The detector calibration, read from the detector |
+| `GET`  | `/api/streamers/<id>/sessions/` | Sessions for one streamer, paginated              |
+| `GET`  | `/api/sessions/<id>/`         | One session with its moment and chat counts         |
+| `GET`  | `/api/sessions/<id>/moments/` | That session's moments, filterable by clip state    |
+| `GET`  | `/api/moments/<id>/`          | One moment with its full score working              |
 
 The health endpoint returns a constant. It deliberately does not report database
 or broker reachability, versions, hostnames or environment values, because it is
@@ -767,6 +804,73 @@ The callback returns the browser to the frontend with a short outcome flag such
 as `?twitch=connected` or `?twitch=error&reason=invalid_state`. No token ever
 reaches the browser, its URL, its storage or its JavaScript state.
 
+### Read-only dashboard
+
+`apps/dashboard` holds every dashboard read: `state.py` (derived display
+state), `queries.py` (querysets and aggregates), `serializers.py` (explicit
+allowlists) and `views.py` (six `GET` endpoints). It defines **no models**, so
+it adds no migration, and it is registered in `INSTALLED_APPS` only so its
+package is importable and testable like any other app.
+
+A separate app rather than views spread across the domain apps, for one reason:
+the overview aggregates across streamers, sessions, moments and clips, and
+belongs to none of them. Putting it in any single domain app would make that app
+depend on the other three. The domain apps keep their own write-path
+serializers untouched.
+
+**Derived clip state.** The persisted `MomentCandidateStatus` cannot on its own
+distinguish "a clip was requested and confirmed pending" from "a clip was
+requested and nobody ever learned the outcome" — both are `CLIP_REQUESTED`. The
+dashboard derives five display states from the candidate and its clip:
+
+| State             | Derived from                                             |
+| ----------------- | -------------------------------------------------------- |
+| `not_requested`   | `DETECTED` or `REJECTED`                                  |
+| `requested`       | `CLIP_REQUESTED` with a Twitch clip id                    |
+| `request_unknown` | `CLIP_REQUESTED` with a clip row and no Twitch clip id    |
+| `created`         | `CLIP_CREATED`                                            |
+| `failed`          | `FAILED`                                                  |
+
+These are presentation only. Nothing writes them back, and no persisted column
+was added for them.
+
+The overview's "recent verified clips" feed uses a stricter rule than any of
+these display states: `CLIP_CREATED` **and** a recorded Twitch clip id **and** a
+non-null `ready_at`, ordered by `ready_at` descending. All three are written by
+the same verification step, so requiring them together means the feed shows a
+clip only once Twitch has confirmed it exists. The existence of a `Clip` row is
+deliberately not sufficient — M6 writes that row before the external request
+precisely so it can represent a request whose outcome is unknown. Because
+`ready_at` is non-null by that filter, PostgreSQL's nulls-first descending sort
+cannot float an unconfirmed row above a confirmed one. The same predicates drive both the conditional-count
+aggregates and the `clip_state` list filter, so a filtered list can never
+disagree with the count that led an operator to it. They partition every
+candidate exactly once, so summary cards sum to the total.
+
+**Cost.** Every list selects the rows its serializer touches
+(`select_related("clip", "session", "session__streamer")`), and every count is a
+conditional aggregate in a single statement. Rendering fifty moments costs the
+same number of queries as rendering one; tests assert the exact counts, and one
+asserts that growing a session from four moments to twenty-nine does not change
+them. Every list is bounded, with a default page of 50 and a hard ceiling of
+200 regardless of the requested `limit`.
+
+**What it cannot do.** Every view accepts `GET` alone, so DRF answers any other
+method with 405 before application code runs. There is no serializer `create` or
+`update`, no service call, no Twitch client and no detector import in the request
+path. Tests assert all of this against every route at once: that each refuses
+`POST`, `PUT`, `PATCH` and `DELETE`; that reading the whole surface leaves the
+moment, clip and session tables byte-identical; and that no route makes an
+outbound HTTP request, runs the detector or requests a clip, with each of those
+patched to raise.
+
+**What it will not publish.** The serializers are allowlists rather than
+`__all__`, so a column added later is never exposed by accident. Chat text,
+chatter hashes and Twitch message identifiers are absent from every response,
+and chat appears only as a per-session message count. Tests assert the absence
+of recognizable fixture chat text, the chatter hash, both message identifiers,
+access and refresh tokens and the client secret from every endpoint's body.
+
 ### Data and messaging
 
 - **PostgreSQL** is the primary datastore. The product tables are
@@ -780,12 +884,11 @@ reaches the browser, its URL, its storage or its JavaScript state.
 
 ### Frontend
 
-`web/` is a Next.js App Router application in TypeScript with Tailwind CSS. It
-serves one route, `/`, which shows the product name, the tagline, a disabled
-streamer URL input representing the future entry point, a Twitch connection
-section, and the live result of calling `GET /api/health/` through the typed
-client in `web/src/lib/api.ts`. The backend base URL comes from
-`NEXT_PUBLIC_API_BASE_URL`.
+`web/` is a Next.js App Router application in TypeScript with Tailwind CSS. Its
+entry route, `/`, shows the product name, the tagline, the streamer resolver, a
+Twitch connection section, and the live result of calling `GET /api/health/`
+through the typed client in `web/src/lib/api.ts`. The backend base URL comes
+from `NEXT_PUBLIC_API_BASE_URL`.
 
 The streamer box posts to `/api/streamers/resolve/` and renders the resolved
 account: profile image, display name, `@username`, broadcaster type and a link
@@ -801,8 +904,25 @@ The Twitch section reads `GET /api/twitch/connection/` and offers a link to
 happens entirely between the backend and Twitch and no credential is available
 to the frontend.
 
-There is no authentication, no routing beyond the single page, no component
-framework and no animation library.
+`/dashboard` is the operator's read-only view of the pipeline, with routes for
+the overview, one streamer's sessions, one session and one moment. Each page is
+a server component that validates its route id and hands it to a client
+component; the client components fetch through the same typed client, which
+models every dashboard response and uses no `any`.
+
+Fetching goes through one small hook, `useResource`, which models a fetch as a
+three-state union — loading, ready, failed — so "loaded but also failed" cannot
+be represented. It has no timer, no interval and no subscription: a page loads
+when it is opened and again when a person presses refresh. There is no
+WebSocket from the backend to the frontend, no Server-Sent Events stream and no
+background poll anywhere in the application.
+
+Loading, empty and failure are treated as first-class states rather than
+afterthoughts. Empty states say *why* they are empty — a quiet session
+legitimately produces no moments — and failures render the backend's own
+user-safe message with a retry control, never raw internals.
+
+There is no authentication, no component framework and no animation library.
 
 ## 4. Planned high-level pipeline
 
@@ -815,8 +935,9 @@ Twitch API access / OAuth         IMPLEMENTED
   -> chat ingestion               IMPLEMENTED (on demand)
   -> moment scoring               IMPLEMENTED (on demand)
   -> Twitch clip                  IMPLEMENTED (on demand)
+  -> ClipperStash dashboard       IMPLEMENTED (read-only)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> ClipperStash dashboard       NOT IMPLEMENTED
+  -> automatic orchestration      NOT IMPLEMENTED
 ```
 
 Expanded, the V0 target pipeline is expected to become:
@@ -830,8 +951,10 @@ Streamer URL                      IMPLEMENTED
   -> moment scoring               IMPLEMENTED (on demand)
   -> interesting moment detection IMPLEMENTED (on demand)
   -> Twitch clip creation         IMPLEMENTED (on demand)
+  -> clip verification            IMPLEMENTED (on demand)
+  -> ClipperStash dashboard       IMPLEMENTED (read-only)
   -> recurring monitoring         NOT IMPLEMENTED
-  -> ClipperStash dashboard       NOT IMPLEMENTED
+  -> automatic orchestration      NOT IMPLEMENTED
 ```
 
 ### Later authorized-media pipeline
@@ -852,7 +975,9 @@ use. It is not part of the current milestone and no media tooling is installed.
 The pieces already in place map onto the pipeline as follows: the `twitch` app
 owns API access and credentials today and will own EventSub and chat ingestion,
 `streamers` owns channel identity, `monitoring` owns live detection, session
-state and chat ingestion, `moments` owns scoring over the stored chat, and
-`clips` owns clip creation and will own the dashboard's read side. Clip creation will use the `clips:edit` scope already
-being requested, and will act on a `Streamer` that has already been resolved. Long-running and scheduled work will run on the existing
-Celery worker against Redis, and all durable state will live in PostgreSQL.
+state and chat ingestion, `moments` owns scoring over the stored chat,
+`clips` owns clip creation, and `dashboard` owns the read side across every
+other app. Clip creation uses the `clips:edit` scope already being requested, and
+acts on a `Streamer` that has already been resolved. Long-running and scheduled
+work will run on the existing Celery worker against Redis, and all durable
+state will live in PostgreSQL.

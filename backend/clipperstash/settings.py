@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "apps.monitoring",
     "apps.moments",
     "apps.clips",
+    "apps.dashboard",
 ]
 
 MIDDLEWARE = [

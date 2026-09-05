@@ -1,5 +1,6 @@
 from django.urls import path
 
+from apps.dashboard import views as dashboard_views
 from apps.monitoring import views as monitoring_views
 from apps.streamers import views
 
@@ -12,5 +13,11 @@ urlpatterns = [
         "<int:streamer_id>/observe/",
         monitoring_views.observe_streamer,
         name="observe",
+    ),
+    # Also streamer-scoped, and also owned elsewhere: this one only reads.
+    path(
+        "<int:streamer_id>/sessions/",
+        dashboard_views.streamer_sessions,
+        name="sessions",
     ),
 ]

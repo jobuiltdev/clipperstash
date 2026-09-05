@@ -8,7 +8,18 @@ window, weight, threshold or saturation point.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+
+# The weights are floats, so their sum is 0.4 + 0.2 + 0.15 + 0.15 + 0.1 ==
+# 1.0000000000000002 rather than exactly 1.0. The invariant is "these weights
+# describe a whole", not "these bits are identical", so it is checked with a
+# tolerance rather than with `==`.
+WEIGHT_SUM_TOLERANCE = 1e-9
+
+
+class DetectorConfigError(ValueError):
+    """A detector calibration that would produce meaningless scores."""
 
 
 @dataclass(frozen=True)
@@ -120,6 +131,74 @@ class DetectorConfig:
     elongatable_tokens: frozenset[str] = field(
         default_factory=lambda: frozenset({"lol", "lmao", "yo", "wow", "omg", "no", "w"})
     )
+
+    def __post_init__(self) -> None:
+        """Refuse a calibration that cannot produce a meaningful score.
+
+        Checked on construction, so an experimental configuration is rejected
+        where it is written rather than silently producing scores nobody can
+        interpret. `dataclasses.replace` re-runs this, so a config derived from
+        the default is validated too.
+        """
+        self.validate()
+
+    def validate(self) -> None:
+        for name, value in (
+            ("current_window_seconds", self.current_window_seconds),
+            ("baseline_window_seconds", self.baseline_window_seconds),
+        ):
+            if value <= 0:
+                raise DetectorConfigError(f"{name} must be greater than zero, got {value!r}.")
+
+        for name, value in (
+            ("min_current_messages", self.min_current_messages),
+            ("min_current_unique_chatters", self.min_current_unique_chatters),
+            ("moment_cooldown_seconds", self.moment_cooldown_seconds),
+        ):
+            if value < 0:
+                raise DetectorConfigError(f"{name} must not be negative, got {value!r}.")
+
+        for name, value in (
+            ("candidate_threshold", self.candidate_threshold),
+            ("auto_clip_threshold", self.auto_clip_threshold),
+        ):
+            # The total is published on a 0-100 scale, so a threshold outside it
+            # is either unreachable or always met.
+            if not 0.0 <= value <= 100.0:
+                raise DetectorConfigError(f"{name} must be between 0 and 100, got {value!r}.")
+
+        weights = self.weights()
+        for name, weight in weights.items():
+            if weight < 0:
+                raise DetectorConfigError(
+                    f"The {name} weight must not be negative, got {weight!r}."
+                )
+
+        total = sum(weights.values())
+        if not math.isclose(total, 1.0, abs_tol=WEIGHT_SUM_TOLERANCE):
+            raise DetectorConfigError(
+                f"The weights must sum to 1.0, got {total!r}. "
+                "They are not normalized automatically: a silent rescale would change "
+                "every score without saying so."
+            )
+
+        for name, value in (
+            ("min_baseline_rate_per_second", self.min_baseline_rate_per_second),
+            ("velocity_saturation_ratio", self.velocity_saturation_ratio),
+            ("velocity_confidence_messages", self.velocity_confidence_messages),
+            ("diversity_saturation_chatters", self.diversity_saturation_chatters),
+            ("emote_saturation_per_message", self.emote_saturation_per_message),
+            ("reaction_saturation_chatters", self.reaction_saturation_chatters),
+            ("absolute_activity_saturation_messages", self.absolute_activity_saturation_messages),
+        ):
+            if value <= 0:
+                raise DetectorConfigError(f"{name} must be greater than zero, got {value!r}.")
+
+        if self.velocity_saturation_ratio <= 1.0:
+            raise DetectorConfigError(
+                "velocity_saturation_ratio must exceed 1.0; at or below it the relative "
+                "term is always zero and velocity stops meaning anything."
+            )
 
     def weights(self) -> dict[str, float]:
         return {

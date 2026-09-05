@@ -530,6 +530,176 @@ every candidate exactly once, so the counts always sum to the total:
 means Twitch said no; an unknown outcome means nobody knows, and the clip may
 well exist.
 
+## Detector evaluation
+
+Milestone 5 established that the detector computes what its formulas say.
+Evaluation asks the other question: **does what it computes correspond to moments
+a person would actually want clipped?**
+
+The workflow is: collect chat from a real stream, watch that stream yourself,
+write down when something clip-worthy happened, then replay the collected chat
+through the detector and compare.
+
+```bash
+python manage.py evaluate_moments 12 --labels evaluation_data/session-12.json
+```
+
+Evaluation reads chat and nothing else. It **never contacts Twitch, never
+creates a clip, never records a moment candidate and never changes a single
+row** — it can be run against the same session as often as you like, and running
+it twice gives the same answer.
+
+### Collecting a session
+
+Every stage is started by hand; nothing chains to the next.
+
+1. Resolve the streamer (`POST /api/streamers/resolve/` or the home page).
+2. Observe them so a live `StreamSession` exists.
+3. Start chat collection and leave it running for the window you want to study:
+
+   ```bash
+   python manage.py monitor_chat <session-id>
+   ```
+
+4. Stop it with Ctrl-C when you have enough.
+5. Observe the streamer again later so the session's state is current.
+
+Collect a meaningful stretch. Twenty minutes containing one moment is not enough
+to calibrate against; several sessions across different conditions — a quiet
+channel, a busy one, a sudden hype event — are what actually generalize.
+
+### Writing labels
+
+Watch the stream or its VOD and note when something genuinely deserved a clip.
+Each label is one instant plus a tolerance: how far from it a detector candidate
+may land and still be the same event.
+
+```json
+{
+  "version": 1,
+  "session_id": 12,
+  "default_tolerance_seconds": 10,
+  "moments": [
+    { "timestamp": "2026-09-05T18:30:15Z", "note": "clutch 1v4" },
+    { "timestamp": "2026-09-05T19:02:48Z", "tolerance_seconds": 20 }
+  ]
+}
+```
+
+`note` is optional and never leaves your machine. Timestamps must carry a
+timezone. Every field is validated: an unknown key, a naive timestamp or labels
+naming a different session are refused rather than quietly evaluated.
+
+Label honestly, including the stretches you would *not* have clipped. A file
+containing only the moments the detector already found measures nothing.
+
+### Where evaluation files live
+
+`backend/evaluation_data/` — ignored by Git except for its README and the two
+synthetic examples in `examples/`.
+
+**Real evaluation data must never be committed.** A label file names a real
+broadcast and the exact seconds a real audience reacted, and a generated report
+describes that audience's behaviour second by second. Neither format has any
+field for chat text or chatter identity, but both describe real people and stay
+on the operator's machine.
+
+### Experimental configurations
+
+An experiment is a small JSON file. Only the fields it names change; everything
+else stays at the production default.
+
+```json
+{
+  "name": "higher-diversity",
+  "candidate_threshold": 72,
+  "cooldown_seconds": 45,
+  "weights": {
+    "velocity": 0.35,
+    "reaction": 0.20,
+    "diversity": 0.20,
+    "emote": 0.15,
+    "absolute_activity": 0.10
+  }
+}
+```
+
+Weights must be given all together and must sum to 1.0. They are never
+normalized for you: a silent rescale would change every score without saying so.
+Unknown fields, negative weights, impossible windows and out-of-range thresholds
+are all refused.
+
+```bash
+python manage.py evaluate_moments 12   --labels evaluation_data/session-12.json   --compare evaluation_data/higher-diversity.json
+```
+
+| Option | Effect |
+| --- | --- |
+| `--labels PATH` | Required. The ground-truth file for this session. |
+| `--config NAME` | A built-in configuration. Only `baseline` exists. |
+| `--config-file PATH` | Evaluate this configuration instead of the built-in one. |
+| `--compare PATH` | Also evaluate this one and show it alongside. Repeatable. |
+| `--cadence-seconds N` | Seconds between evaluations. Default 1. |
+| `--output PATH` | Write a JSON report. Never committed. |
+
+Results are ranked by F1 **for reading only**. Nothing promotes the top row to
+production, and neither should you on one session's evidence.
+
+### Reading the numbers
+
+| Metric | Means |
+| --- | --- |
+| Precision | Of the candidates the detector produced, the share you had labelled. Low precision means it fires at nothing. |
+| Recall | Of the moments you labelled, the share it found. Low recall means it misses things. |
+| F1 | The harmonic mean of the two. One number, and easy to over-trust on few labels. |
+| Candidate rate/hour | How often it would fire in production. An over-sensitive configuration shows up here before it shows up in F1. |
+| Timing error | How far a candidate landed from the labelled instant. |
+
+Nothing is ever `NaN`. Precision is 0 when nothing was predicted — a detector
+that never fires has achieved nothing, not perfect precision. Recall is 0 when
+labelled moments went unfound, and also 0 when there are no labels at all; the
+report marks that second case with `has_ground_truth: false`.
+
+### Threshold crossings versus candidates
+
+Two different counts, and the distinction matters:
+
+- **Threshold crossing** — the detector judged this window clip-worthy.
+- **Candidate** — it would also have recorded one, cooldown permitting.
+
+One burst crosses the threshold on every tick it covers but produces a single
+candidate, because production suppresses the rest for
+`moment_cooldown_seconds`. Both are reported: the candidate count is what
+production does, and the crossing count is how strongly the detector saw the
+moment. Discarding suppressed crossings would hide the difference between "found
+it once" and "found it unmistakably for thirty seconds".
+
+### Evaluation cadence
+
+Replay evaluates on a fixed grid — every second by default — aligned to whole
+seconds from the first collected message. The cadence changes the results (a
+coarse grid can step over a short spike; a fine one reports the same spike many
+times), so it is printed with every run and recorded in every report.
+
+The first `baseline + current` seconds of any collection are a warm-up: the
+baseline window reaches back past the first message collected, so velocity is
+inflated by an artefact of *when you started monitoring* rather than by anything
+the stream did. Those ticks are reported and counted, and they are worth
+ignoring when judging a calibration.
+
+Replay hands the detector the collected messages exactly as they are, so
+evaluation and production read chat through the same code. That costs speed —
+about 19 seconds for an hour of busy chat at one-second cadence — which is the
+right trade for an offline command. Use a coarser `--cadence-seconds` if a long
+session takes too long.
+
+### Changing the production default
+
+Don't, on one session. A configuration wins on a handful of labels for all sorts
+of uninteresting reasons. Before proposing a new default, gather baseline and
+proposed metrics across several sessions and different stream conditions, and
+compare false positives, false negatives and candidate rate — not just F1.
+
 ## Checks
 
 Backend (from `backend/`, with the virtualenv active):
@@ -539,6 +709,7 @@ pytest
 ruff check .
 ruff format --check .
 python manage.py check
+python manage.py makemigrations --check --dry-run
 ```
 
 Frontend (from `web/`):

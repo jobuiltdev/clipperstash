@@ -1,0 +1,12 @@
+{
+  "name": "example-higher-diversity",
+  "candidate_threshold": 72,
+  "cooldown_seconds": 45,
+  "weights": {
+    "velocity": 0.35,
+    "reaction": 0.2,
+    "diversity": 0.2,
+    "emote": 0.15,
+    "absolute_activity": 0.1
+  }
+}

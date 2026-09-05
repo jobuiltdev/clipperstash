@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "session_id": 999999,
+  "default_tolerance_seconds": 10,
+  "moments": [
+    {
+      "timestamp": "2026-01-01T12:05:30Z",
+      "note": "synthetic example moment"
+    },
+    {
+      "timestamp": "2026-01-01T12:41:12Z",
+      "tolerance_seconds": 20,
+      "note": "synthetic example with a wider window"
+    },
+    {
+      "timestamp": "2026-01-01T13:18:04Z"
+    }
+  ]
+}

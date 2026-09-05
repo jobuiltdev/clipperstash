@@ -114,6 +114,21 @@ That completes the V0 pipeline as a sequence of manual steps.
 The dashboard only observes. It performs no write, contacts no external service
 and refreshes only when a person asks it to.
 
+**Milestone 8 — detector evaluation and calibration tooling. IMPLEMENTED.**
+
+- Deterministic offline replay of the detector over collected chat, on a fixed
+  evaluation grid, writing nothing.
+- A manual ground-truth label format, kept in an ignored local directory.
+- One-to-one matching of candidates against labels, and precision, recall, F1,
+  timing error and candidate rate computed from it.
+- Comparison of named detector configurations over the same session, ranked for
+  reading and promoting nothing.
+- An `evaluate_moments` command and an optional local JSON report.
+
+Evaluation is observational in the same sense the dashboard is: it creates no
+candidate, no clip and no session, changes nothing that exists, and contacts
+Twitch not at all. It measures the detector; it does not run the pipeline.
+
 Every stage of the V0 pipeline described in these milestones exists and can be
 run. **None of it runs by itself.** Chat ingestion, detection and clip creation are each started
 explicitly by a person, and no stage invokes the next. That an operator can
@@ -127,8 +142,11 @@ Explicitly still out of scope:
   creation each run only when a person starts them, and none invokes the next.
 - Automatic monitor -> detect -> clip orchestration, and any automatic or
   continuous detector scheduling.
-- Detector calibration against real collected streams, which is Milestone 8's
-  work. Today's weights, thresholds and saturation points are initial values.
+- A calibrated production detector. The tooling to measure one exists, but no
+  real-stream evidence has been gathered and the shipped weights, thresholds
+  and saturation points are still the initial values.
+- Automatic or scheduled evaluation, and any automatic promotion of an
+  experimental configuration to the production default.
 - Create Clip From VOD and any historical clipping. Live Create Clip captures
   what is airing when the request arrives, so a moment that has passed cannot
   be clipped.
@@ -179,6 +197,9 @@ the health view and the Celery application. Product code lives under
 | `moments`    | Moment scoring and interesting-moment detection              | IMPLEMENTED (see below) |
 | `clips`      | Clip records and clip creation                               | IMPLEMENTED (see below) |
 | `dashboard`  | Read-only presentation across every other app; no models     | IMPLEMENTED (see below) |
+
+`moments` additionally contains `evaluation/`, an offline calibration layer
+with no models and no database writes of its own.
 
 The EventSub transport lives in `twitch`, under `apps/twitch/eventsub/`;
 `monitoring` owns the chat domain that consumes it, `moments` owns detection over
@@ -804,6 +825,93 @@ The callback returns the browser to the frontend with a short outcome flag such
 as `?twitch=connected` or `?twitch=error&reason=invalid_state`. No token ever
 reaches the browser, its URL, its storage or its JavaScript state.
 
+### Detector evaluation
+
+`apps/moments/evaluation/` answers a different question from the detector tests.
+Milestone 5 proved the arithmetic; this measures whether the arithmetic
+corresponds to moments a person would clip. It holds `config.py` (named and
+file-supplied calibrations), `labels.py` (operator ground truth), `replay.py`
+(the grid), `matching.py`, `metrics.py`, `comparison.py` and `report.py`. It
+defines **no models**, adds no migration and writes nothing.
+
+**One scoring truth.** Replay contains no scoring logic. Every number it reports
+comes from `score_samples`, the same function `apps.moments.services` calls in
+production, and a regression test compares every observation against a direct
+call to it. The detector already accepted its calibration as an argument
+everywhere, so Milestone 8 needed no refactor to make configuration injectable —
+only validation, a name for the baseline and a file format for experiments.
+
+**The baseline is the default.** `evaluation.baseline()` returns `DEFAULT_CONFIG`
+itself rather than a reconstruction, so it cannot drift away from what the
+pipeline runs. A separate test pins each production constant to its Milestone 5
+literal, so changing one fails as a deliberate calibration decision rather than
+passing as a refactor.
+
+**Cadence.** Production evaluates when a person asks; replay has no such moment,
+so it imposes a grid — every `cadence_seconds`, one by default, aligned to whole
+seconds from the first collected message. The cadence materially changes results
+and is reported with every one of them. The opening `baseline + current` seconds
+are a warm-up whose baseline window reaches back past the collected chat;
+observations carry `baseline_complete` so those ticks can be recognized and, with
+`require_complete_baseline`, excluded.
+
+**Crossing versus candidate.** An observation records `threshold_crossed`
+(the detector judged this window clip-worthy), `cooldown_suppressed` and
+`would_create_candidate` separately. Production creates one candidate per burst;
+calibration needs to know the detector saw the moment on thirty consecutive
+ticks. Cooldown is simulated against replay's own candidates using the same
+boundary rule as `services.is_in_cooldown`, since replay writes no rows to
+consult.
+
+**Matching.** Strictly one-to-one, so a burst cannot count as several true
+positives against one label. Pairs within a label's tolerance are assigned
+greedily nearest-first, with ties broken by earlier label then earlier
+candidate. Greedy nearest is not globally optimal; it is deterministic, simple
+to explain, and optimal on ground truth spaced further apart than its own
+tolerance, which is what an operator should be labelling.
+
+**Metrics.** Precision, recall, F1, true and false positives, false negatives,
+mean and median timing error, candidate rate per hour and threshold-crossing rate
+per hour. No metric is ever `NaN`: precision is 0 with no predictions (a detector
+that never fires has achieved nothing, not perfect precision), recall is 0 both
+when labelled moments go unfound and when there are no labels, with
+`has_ground_truth` distinguishing the two. The rates exist because precision and
+recall over a handful of labels are easy to flatter, while an over-sensitive
+calibration shows up in candidates-per-hour immediately.
+
+**Nothing is promoted.** `rank()` sorts results for reading and no code path
+treats position zero as a winner. Changing a production default is a reviewed
+decision backed by several sessions.
+
+**Privacy.** Console output and JSON reports contain aggregates, timestamps and
+configuration names only. There is no field anywhere for chat text, chatter hash,
+Twitch message id, token or provider payload, and a label's free-text note is
+deliberately not written into a report. Tests walk the whole report structure
+rather than checking a field list. Real labels and generated reports live in
+`backend/evaluation_data/`, which ignores its own contents except a README and
+two synthetic examples.
+
+**Nothing is pre-processed.** Replay passes the original `ChatSample` rows into
+`score_samples` untouched. It has no knowledge of which words read as a
+reaction, which signals inspect text, or how text might be rewritten while
+preserving a score — all of that stays inside the detector. An earlier version
+substituted a reaction-equivalent stand-in text to make the per-window work
+cheaper. It was removed: even though it provably preserved today's five signals,
+it gave the evaluator an opinion about detector-internal semantics, and a signal
+added later that read text differently would have drifted away from production
+with nothing failing. Tests assert the absence of any transformation — the exact
+sample objects reach the detector, every original text is seen, and no
+evaluation module names the text-reading machinery.
+
+**Cost.** Replay slices the sample list per tick with `bisect` rather than
+handing the whole session to the detector each time, so it stays linear in
+message count: 10,000 messages over an hour take 18.6s at one-second cadence
+(3,601 observations), 9.2s at two seconds and 3.7s at five; 20,000 messages take
+36.3s, a clean 2x. Removing the text substitution roughly doubled the runtime,
+which is the right trade for an offline command that must not be able to drift
+from production. A coarser `--cadence-seconds` is the lever when a long session
+takes too long.
+
 ### Read-only dashboard
 
 `apps/dashboard` holds every dashboard read: `state.py` (derived display
@@ -936,6 +1044,7 @@ Twitch API access / OAuth         IMPLEMENTED
   -> moment scoring               IMPLEMENTED (on demand)
   -> Twitch clip                  IMPLEMENTED (on demand)
   -> ClipperStash dashboard       IMPLEMENTED (read-only)
+  -> offline evaluation           IMPLEMENTED (on demand)
   -> recurring monitoring         NOT IMPLEMENTED
   -> automatic orchestration      NOT IMPLEMENTED
 ```
@@ -953,6 +1062,8 @@ Streamer URL                      IMPLEMENTED
   -> Twitch clip creation         IMPLEMENTED (on demand)
   -> clip verification            IMPLEMENTED (on demand)
   -> ClipperStash dashboard       IMPLEMENTED (read-only)
+  -> offline detector evaluation  IMPLEMENTED (on demand)
+  -> calibrated production config NOT IMPLEMENTED
   -> recurring monitoring         NOT IMPLEMENTED
   -> automatic orchestration      NOT IMPLEMENTED
 ```

@@ -1,0 +1,8 @@
+# Everything an operator collects here is derived from a real broadcast and real
+# people's chat. None of it belongs in the repository, so this directory ignores
+# its own contents by default and admits only the synthetic examples.
+*
+!.gitignore
+!README.md
+!examples/
+!examples/*.json

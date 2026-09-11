@@ -14,10 +14,5 @@ export default async function StreamerPage({
     notFound();
   }
 
-  return (
-    <div className="space-y-6">
-      <h1 className="text-3xl font-semibold tracking-tight">Streamer</h1>
-      <StreamerSessions streamerId={id} />
-    </div>
-  );
+  return <StreamerSessions streamerId={id} />;
 }

@@ -1,3 +1,5 @@
+import { Badge, type Tone } from "@/components/ui/status";
+
 import type { ClipState } from "@/lib/api";
 
 /**
@@ -6,7 +8,8 @@ import type { ClipState } from "@/lib/api";
  * The wording matters more than it looks. `request_unknown` must never read as
  * a failure: the pipeline claimed a request and then never learned what Twitch
  * did with it, so the clip may well exist. Calling that "Failed" would tell an
- * operator something nobody actually knows.
+ * operator something nobody actually knows — which is why it has its own tone
+ * as well as its own words.
  */
 export const CLIP_STATE_LABEL: Record<ClipState, string> = {
   not_requested: "No clip",
@@ -25,20 +28,18 @@ export const CLIP_STATE_DETAIL: Record<ClipState, string> = {
   failed: "Twitch answered, and the clip was not created.",
 };
 
-const CLIP_STATE_CLASS: Record<ClipState, string> = {
-  not_requested: "border-border text-muted",
-  requested: "border-sky-500/50 text-sky-500",
-  request_unknown: "border-amber-500/50 text-amber-500",
-  created: "border-emerald-500/50 text-emerald-500",
-  failed: "border-rose-500/50 text-rose-500",
+export const CLIP_STATE_TONE: Record<ClipState, Tone> = {
+  not_requested: "neutral",
+  requested: "pending",
+  request_unknown: "unknown",
+  created: "live",
+  failed: "failed",
 };
 
 export function ClipStateBadge({ state }: { state: ClipState }) {
   return (
-    <span
-      className={`inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs ${CLIP_STATE_CLASS[state]}`}
-    >
+    <Badge tone={CLIP_STATE_TONE[state]} dot>
       {CLIP_STATE_LABEL[state]}
-    </span>
+    </Badge>
   );
 }

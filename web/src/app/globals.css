@@ -1,36 +1,146 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #12121a;
-  --muted: #6b7280;
-  --border: #e5e7eb;
-  --surface: #f9fafb;
-}
+/**
+ * ClipperStash is a dark interface.
+ *
+ * Not a preference toggle: this is a tool for people watching a bright video
+ * feed, and a single committed surface keeps status colour meaning one thing
+ * everywhere. The palette is deliberately neutral — the only chroma in the
+ * product is semantic, so anything coloured on screen is telling you something.
+ */
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0b0b10;
-    --foreground: #ededf2;
-    --muted: #9ca3af;
-    --border: #23232d;
-    --surface: #131320;
-  }
+:root {
+  color-scheme: dark;
+
+  /* Depth. Three steps, used consistently: page, card, raised element. */
+  --background: #0b0c0f;
+  --surface: #121419;
+  --raised: #191c22;
+
+  /* Text. Four steps from primary to barely-there. */
+  --foreground: #e9ebef;
+  --muted: #9aa2ad;
+  --faint: #6b7280;
+  --inverse: #0b0c0f;
+
+  /* Lines. `strong` is for hover and focus, not for ordinary structure. */
+  --border: #23262d;
+  --border-strong: #333842;
+
+  /* Status. The only colours in the interface, and each means one thing:
+     live/ready, in flight, unknown outcome, failed. */
+  --live: #34d399;
+  --pending: #60a5fa;
+  --unknown: #fbbf24;
+  --failed: #fb7185;
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+
   --color-foreground: var(--foreground);
   --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-inverse: var(--inverse);
+
   --color-border: var(--border);
-  --color-surface: var(--surface);
+  --color-border-strong: var(--border-strong);
+
+  --color-live: var(--live);
+  --color-pending: var(--pending);
+  --color-unknown: var(--unknown);
+  --color-failed: var(--failed);
+
   --font-sans:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
     Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+
+html {
+  /* Anchored navigation lands below the sticky header rather than under it. */
+  scroll-padding-top: 5rem;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Headings are set tighter than body text; long numbers line up in columns. */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.015em;
+}
+
+/**
+ * One focus treatment for the whole product.
+ *
+ * `:focus-visible` rather than `:focus`, so a mouse click on a card does not
+ * ring it, but a keyboard tab always does.
+ */
+:focus-visible {
+  outline: 2px solid var(--foreground);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/**
+ * Motion is used for state changes only — a row lifting under the pointer, a
+ * panel arriving. Anyone who has asked their system for less gets none of it.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Applied to page content, so a view arrives rather than snapping in. */
+.animate-enter {
+  animation: enter 0.22s ease-out both;
+}
+
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* The one continuous animation in the product, and it carries meaning: this
+   broadcast was live at the last observation. */
+.animate-live {
+  animation: live-pulse 2s ease-in-out infinite;
+}
+
+/* Scrollbars inside the dark shell, where the platform allows it. */
+* {
+  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-width: thin;
 }

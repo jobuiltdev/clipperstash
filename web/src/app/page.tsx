@@ -1,107 +1,20 @@
-"use client";
+import type { Metadata } from "next";
 
-import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { SetupWorkspace } from "@/components/setup/setup-workspace";
+import { PageContainer } from "@/components/ui/page";
 
-import { StreamerResolver } from "@/components/streamer-resolver";
-import { TwitchConnection } from "@/components/twitch-connection";
-import { API_BASE_URL, getHealth } from "@/lib/api";
-
-type BackendState =
-  | { kind: "checking" }
-  | { kind: "online"; status: string }
-  | { kind: "offline"; detail: string };
-
-const STATE_STYLES: Record<BackendState["kind"], string> = {
-  checking: "bg-amber-400",
-  online: "bg-emerald-500",
-  offline: "bg-rose-500",
+export const metadata: Metadata = {
+  // Spelled out rather than relying on the root template: Next applies a
+  // parent `title.template` to child segments, and this page is the root
+  // segment itself, so it would otherwise render as a bare "Setup".
+  title: "Setup · ClipperStash",
+  description: "Connect Twitch and resolve the channel ClipperStash should watch.",
 };
 
-function describe(state: BackendState): string {
-  switch (state.kind) {
-    case "checking":
-      return "Checking backend…";
-    case "online":
-      return `Backend reachable (status: ${state.status})`;
-    case "offline":
-      return `Backend unreachable — ${state.detail}`;
-  }
-}
-
-export default function Home() {
-  const [state, setState] = useState<BackendState>({ kind: "checking" });
-  const [attempt, setAttempt] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    getHealth()
-      .then((health) => {
-        if (!cancelled) {
-          setState({ kind: "online", status: health.status });
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setState({
-            kind: "offline",
-            detail: error instanceof Error ? error.message : "unknown error",
-          });
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [attempt]);
-
-  const recheck = useCallback(() => {
-    setState({ kind: "checking" });
-    setAttempt((value) => value + 1);
-  }, []);
-
+export default function SetupPage() {
   return (
-    <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center gap-10 px-6 py-20">
-      <header className="space-y-3">
-        <h1 className="text-4xl font-semibold tracking-tight">ClipperStash</h1>
-        <p className="text-lg text-muted">
-          Turn live moments into clips automatically.
-        </p>
-        <Link href="/dashboard" className="inline-block text-sm underline underline-offset-2">
-          Open the dashboard
-        </Link>
-      </header>
-
-      <StreamerResolver />
-
-      <TwitchConnection />
-
-      <section aria-labelledby="status-heading" className="space-y-3">
-        <h2 id="status-heading" className="text-sm font-medium">
-          Backend status
-        </h2>
-        <div className="flex items-center gap-3">
-          <span
-            aria-hidden
-            className={`size-2.5 shrink-0 rounded-full ${STATE_STYLES[state.kind]}`}
-          />
-          <p role="status" className="text-sm">
-            {describe(state)}
-          </p>
-        </div>
-        <p className="text-sm text-muted">
-          Source: <code>GET {API_BASE_URL}/api/health/</code>
-        </p>
-        <button
-          type="button"
-          onClick={recheck}
-          disabled={state.kind === "checking"}
-          className="rounded-md border border-border px-3 py-1.5 text-sm font-medium disabled:opacity-50"
-        >
-          Re-check
-        </button>
-      </section>
-    </main>
+    <PageContainer>
+      <SetupWorkspace />
+    </PageContainer>
   );
 }

@@ -6,8 +6,8 @@ import type { MomentSummary } from "@/lib/api";
  * The score, and why it came out that way.
  *
  * A bare 0–100 number is not reviewable: two moments can share a total and be
- * completely different events. Every view that shows a score therefore shows
- * the components it was built from, and the threshold it was measured against.
+ * completely different events. Every view that shows a score therefore shows the
+ * components it was built from and the threshold it was measured against.
  */
 
 export function ScoreDial({
@@ -18,17 +18,41 @@ export function ScoreDial({
   threshold: number | null;
 }) {
   const above = threshold !== null && score >= threshold;
+  const fraction = Math.max(0, Math.min(1, score / 100));
+
   return (
-    <div className="flex items-baseline gap-2">
-      <span
-        className={`text-3xl font-semibold tabular-nums ${above ? "text-emerald-500" : ""}`}
-      >
-        {formatScore(score)}
-      </span>
-      {threshold !== null && (
-        <span className="text-sm text-muted">
-          / threshold {formatScore(threshold)}
+    <div className="flex items-center gap-4">
+      <div>
+        <span
+          className={`text-4xl font-semibold tabular-nums tracking-tight ${
+            above ? "text-live" : "text-foreground"
+          }`}
+        >
+          {formatScore(score)}
         </span>
+        <span className="ml-1 text-base text-faint">/100</span>
+      </div>
+
+      {threshold !== null && (
+        <div className="min-w-0 flex-1 space-y-1.5">
+          {/* The bar carries the threshold as a tick, so "how far over the line"
+              is legible without reading two numbers and subtracting. */}
+          <div className="relative h-1.5 overflow-hidden rounded-full bg-raised">
+            <div
+              className={`h-full rounded-full ${above ? "bg-live" : "bg-muted"}`}
+              style={{ width: `${fraction * 100}%` }}
+            />
+            <span
+              aria-hidden
+              className="absolute inset-y-0 w-px bg-border-strong"
+              style={{ left: `${threshold}%` }}
+            />
+          </div>
+          <p className="text-xs text-muted">
+            Threshold {formatScore(threshold)}
+            {above ? " · cleared" : " · not reached"}
+          </p>
+        </div>
       )}
     </div>
   );
@@ -44,16 +68,12 @@ export function ComponentBar({
   weight?: number;
 }) {
   const percent = Math.max(0, Math.min(1, value)) * 100;
+
   return (
-    <div className="space-y-1">
-      <div className="flex items-baseline justify-between gap-3 text-xs">
-        <span>
-          {label}
-          {weight !== undefined && (
-            <span className="text-muted"> · weight {formatComponent(weight)}</span>
-          )}
-        </span>
-        <span className="tabular-nums text-muted">{formatComponent(value)}</span>
+    <div className="space-y-1.5">
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-sm text-foreground">{label}</span>
+        <span className="text-sm tabular-nums text-muted">{formatComponent(value)}</span>
       </div>
       <div
         role="meter"
@@ -61,10 +81,16 @@ export function ComponentBar({
         aria-valuenow={Math.round(percent)}
         aria-valuemin={0}
         aria-valuemax={100}
-        className="h-1.5 overflow-hidden rounded-full bg-border"
+        className="h-1.5 overflow-hidden rounded-full bg-raised"
       >
-        <div className="h-full rounded-full bg-foreground/60" style={{ width: `${percent}%` }} />
+        <div
+          className="h-full rounded-full bg-foreground/70 transition-[width] duration-300"
+          style={{ width: `${percent}%` }}
+        />
       </div>
+      {weight !== undefined && (
+        <p className="text-xs text-faint">Weight {formatComponent(weight)}</p>
+      )}
     </div>
   );
 }
@@ -85,7 +111,7 @@ export function ScoreBreakdown({
   weights?: Record<string, number>;
 }) {
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
       {COMPONENTS.map(({ key, label, weight }) => (
         <ComponentBar
           key={key}
